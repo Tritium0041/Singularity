@@ -1,0 +1,80 @@
+export type JsonSchema = {
+  type?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  additionalProperties?: boolean;
+  description?: string;
+  enum?: unknown[];
+  items?: JsonSchema;
+  [key: string]: unknown;
+};
+
+export type AgentMessage = UserMessage | AssistantMessage | ToolResultMessage;
+
+export type UserMessage = {
+  role: "user";
+  content: string;
+};
+
+export type AssistantMessage = {
+  role: "assistant";
+  content: string;
+  toolCalls?: ToolCall[];
+  reasoning?: ReasoningOutput;
+  raw?: unknown;
+};
+
+export type ToolResultMessage = {
+  role: "tool";
+  toolCallId: string;
+  toolName: string;
+  content: string;
+  isError?: boolean;
+};
+
+export type ToolCall = {
+  id: string;
+  name: string;
+  arguments: unknown;
+};
+
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
+
+export type ReasoningOptions = {
+  effort?: ReasoningEffort;
+  summary?: ReasoningSummary;
+  includeEncryptedContent?: boolean;
+};
+
+export type ReasoningOutput = {
+  summary?: string;
+};
+
+export type AgentEvent =
+  | { type: "agent_start"; input: string }
+  | { type: "turn_start"; turn: number }
+  | { type: "thinking_delta"; turn: number; delta: string; content: string }
+  | { type: "assistant_delta"; turn: number; delta: string; content: string }
+  | { type: "tool_call_delta"; turn: number; toolCallId: string; toolName: string; delta: string; argumentsText: string }
+  | { type: "message"; message: AgentMessage }
+  | { type: "tool_start"; turn: number; toolCall: ToolCall }
+  | { type: "tool_end"; turn: number; toolCall: ToolCall; result: ToolResultMessage }
+  | { type: "turn_end"; turn: number; message: AssistantMessage; toolResults: ToolResultMessage[] }
+  | { type: "agent_end"; result: AgentRunResult };
+
+export type AgentEventSink = (event: AgentEvent) => void | Promise<void>;
+
+export type AgentRunResult = {
+  output: string;
+  messages: AgentMessage[];
+  turns: number;
+  stoppedBy: "final" | "max_turns";
+};
+
+export type AgentRunOptions = {
+  maxTurns?: number;
+  reasoning?: ReasoningOptions | false;
+  signal?: AbortSignal;
+};
