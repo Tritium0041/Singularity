@@ -30,6 +30,7 @@ export type ToolResultMessage = {
   toolName: string;
   content: string;
   isError?: boolean;
+  details?: unknown;
 };
 
 export type ToolCall = {

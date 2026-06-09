@@ -89,7 +89,8 @@ function toToolResultMessage(toolCall: ToolCall, result: ToolResult): ToolResult
     toolCallId: toolCall.id,
     toolName: toolCall.name,
     content: result.content,
-    isError: result.isError
+    isError: result.isError,
+    details: result.details
   };
 }
 

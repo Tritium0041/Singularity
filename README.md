@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity is a minimal TypeScript agent runtime for experimenting with LLM tool use. It provides a small agent loop, pluggable LLM clients, tool registration and execution, streaming events, and an OpenAI Responses API client.
+Singularity is a minimal TypeScript agent runtime for experimenting with LLM tool use. It provides a small agent loop, pluggable LLM clients, provider selection, tool registration and execution, streaming events, and provider adapters for OpenAI Responses, OpenAI-compatible Chat Completions, and Anthropic Messages.
 
 ## Features
 
@@ -8,14 +8,15 @@ Singularity is a minimal TypeScript agent runtime for experimenting with LLM too
 - Sequential or parallel tool execution.
 - Tool argument validation against simple JSON Schema shapes.
 - Streaming text, reasoning summary, and tool-call events.
-- OpenAI Responses API support with configurable model, base URL, and reasoning options.
-- Built-in example tools for calculator and deterministic mock weather.
+- OpenAI Responses, OpenAI-compatible Chat Completions, and Anthropic Messages support.
+- Built-in basic, file, shell, and web/search tools.
+- Tool output truncation for large file, command, and URL results.
 
 ## Requirements
 
 - Node.js 18 or newer.
 - npm.
-- `OPENAI_API_KEY` for the OpenAI-powered demo.
+- An API key for the provider used by the demo.
 
 ## Install
 
@@ -33,31 +34,64 @@ npm run build
 ## Run The Demo
 
 ```sh
-OPENAI_API_KEY=your_key_here npm run demo
+LLM_API_KEY=your_key_here npm run demo
 ```
 
 You can pass a custom prompt:
 
 ```sh
-OPENAI_API_KEY=your_key_here npm run demo -- "What is (123 + 456) * 789?"
+LLM_API_KEY=your_key_here npm run demo -- "What is (123 + 456) * 789?"
 ```
 
 Optional environment variables:
 
-- `OPENAI_MODEL`: model name used by the demo. Defaults to `gpt-4.1-mini`.
-- `OPENAI_BASE_URL`: alternate OpenAI-compatible API base URL.
+- `LLM_PROVIDER`: `openai-responses`, `openai-chat`, or `anthropic`. Defaults to `openai-responses`.
+- `LLM_MODEL`: model name used by the demo.
+- `LLM_API_KEY`: generic API key used before provider-specific fallbacks.
+- `LLM_BASE_URL`: generic API base URL used before provider-specific fallbacks.
+- `OPENAI_MODEL` / `OPENAI_BASE_URL` / `OPENAI_API_KEY`: fallback values for `openai-responses`.
+- `OPENAI_COMPAT_MODEL` / `OPENAI_COMPAT_BASE_URL` / `OPENAI_COMPAT_API_KEY`: fallback values for `openai-chat`.
+- `ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`: fallback values for `anthropic`.
 - `AGENT_REASONING_EFFORT`: reasoning effort passed to supported models.
+- `AGENT_TOOLSET`: `basic`, `files`, `shell`, `web`, or `all`. Defaults to `basic`.
+- `AGENT_MAX_TURNS`: positive integer overriding the demo run's max turn count. The agent default is `8`.
+- `TAVILY_API_KEY`: required by the `web_search` tool.
+
+OpenAI-compatible local or third-party providers can use the Chat Completions adapter:
+
+```sh
+LLM_PROVIDER=openai-chat \
+LLM_BASE_URL=http://localhost:11434/v1 \
+LLM_API_KEY=ollama \
+LLM_MODEL=qwen3 \
+AGENT_TOOLSET=files \
+AGENT_MAX_TURNS=12 \
+npm run demo -- "List this directory and read README.md."
+```
+
+Long-chain tool stress test:
+
+```sh
+LLM_API_KEY=your_key_here \
+TAVILY_API_KEY=your_tavily_key_here \
+AGENT_TOOLSET=all \
+npm run demo -- "Read README.md, search for TypeScript tool-call design notes, fetch one result, and write a short summary to tmp/provider-tool-notes.md."
+```
+
+`execute_command` is intentionally powerful and is not a security sandbox. It only constrains its `workdir` to the configured `rootDir`; commands can still invoke the local shell and access the host according to normal OS permissions. Keep `AGENT_TOOLSET` at `basic` unless you want to expose stronger tools.
 
 ## Basic Usage
 
 ```ts
-import { Agent, OpenAIResponsesClient, calculatorTool } from "./src/index.js";
+import { Agent, createCoreTools, createLlmClientFromEnv } from "./src/index.js";
+
+const llm = createLlmClientFromEnv();
 
 const agent = new Agent({
-  llm: new OpenAIResponsesClient(),
-  model: "gpt-4.1-mini",
+  llm: llm.llm,
+  model: llm.model,
   systemPrompt: "You are a concise assistant. Use tools when useful.",
-  tools: [calculatorTool]
+  tools: createCoreTools({ toolset: "basic" })
 });
 
 const result = await agent.run("Calculate (123 + 456) * 789.");
@@ -67,8 +101,8 @@ console.log(result.output);
 ## Project Structure
 
 - `src/agent`: the agent loop and event flow.
-- `src/llm`: LLM interfaces, provider registry, and OpenAI Responses client.
-- `src/tools`: tool registry, executor, validation, and built-in tools.
+- `src/llm`: LLM interfaces, provider registry, env factory, and provider clients.
+- `src/tools`: tool registry, executor, validation, built-in tools, and core tool factories.
 - `examples`: runnable agent demo.
 - `tests`: node test coverage for the agent loop and client behavior.
 

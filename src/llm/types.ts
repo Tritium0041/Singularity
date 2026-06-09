@@ -38,6 +38,7 @@ export type LlmProviderFactoryOptions = {
   baseURL?: string;
   defaultModel?: string;
   defaultReasoning?: ReasoningOptions | false;
+  fetchImpl?: typeof fetch;
 };
 
 export interface LlmProviderFactory {
