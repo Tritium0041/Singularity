@@ -6,6 +6,7 @@ export * from "./llm/openai-chat-completions-client.js";
 export * from "./llm/anthropic-messages-client.js";
 export * from "./llm/env-factory.js";
 export * from "./llm/provider-registry.js";
+export * from "./context/index.js";
 export * from "./tools/registry.js";
 export * from "./tools/builtins.js";
 export * from "./tools/core-tools.js";

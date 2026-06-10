@@ -1,6 +1,15 @@
-import { Agent, createCoreTools, createLlmClientFromEnv, type CoreToolset } from "../src/index.js";
+import {
+  Agent,
+  createCoreTools,
+  createLlmClientFromEnv,
+  type AgentEvent,
+  type CoreToolset,
+  type RequestContextMetadata,
+  type TokenUsage
+} from "../src/index.js";
 
 let streamedText = false;
+let streamNeedsNewline = false;
 let turnStreamedThinking = false;
 let turnStreamedText = false;
 const llm = createLlmClientFromEnv();
@@ -30,6 +39,7 @@ const agent = new Agent({
     }
     if (event.type === "assistant_delta") {
       streamedText = true;
+      streamNeedsNewline = true;
       if (!turnStreamedText && turnStreamedThinking) {
         console.log("\n[answer]");
       }
@@ -41,6 +51,7 @@ const agent = new Agent({
         turnStreamedThinking = true;
         console.log("\n[thinking]");
       }
+      streamNeedsNewline = true;
       process.stdout.write(event.delta);
     }
     if (event.type === "tool_start") {
@@ -49,6 +60,13 @@ const agent = new Agent({
     if (event.type === "tool_end") {
       console.log(`[observation] ${event.result.content}`);
     }
+    if (event.type === "turn_end") {
+      if (streamNeedsNewline) {
+        console.log();
+        streamNeedsNewline = false;
+      }
+      console.log(formatTurnTokenUsage(event));
+    }
   }
 });
 
@@ -56,8 +74,60 @@ const prompt = process.argv.slice(2).join(" ") || "Calculate (123 + 456) * 789, 
 const result = await agent.run(prompt, maxTurns === undefined ? {} : { maxTurns });
 if (result.output && !streamedText) {
   console.log(`\n${result.output}`);
-} else if (streamedText) {
+} else if (streamNeedsNewline) {
   console.log();
+}
+
+function formatTurnTokenUsage(event: Extract<AgentEvent, { type: "turn_end" }>): string {
+  return `[tokens] turn ${event.turn} ${formatRequestContext(event.context)}; ${formatProviderUsage(event.message.usage)}`;
+}
+
+function formatRequestContext(context: RequestContextMetadata | undefined): string {
+  if (!context || context.estimatedInputTokens === undefined) {
+    return "context=unavailable";
+  }
+
+  const notes: string[] = [];
+  if (context.tokenEstimateSource) {
+    notes.push(context.tokenEstimateSource);
+  }
+  if (context.compacted) {
+    notes.push("compacted");
+  }
+  if (context.compactionSummarySource) {
+    notes.push(`summary=${context.compactionSummarySource}`);
+  }
+  if (context.compactionDecisionEstimatedInputTokens !== undefined) {
+    const source = context.compactionDecisionTokenEstimateSource ? ` ${context.compactionDecisionTokenEstimateSource}` : "";
+    notes.push(`decision=${formatTokenCount(context.compactionDecisionEstimatedInputTokens)}${source}`);
+  }
+
+  const suffix = notes.length > 0 ? ` (${notes.join(", ")})` : "";
+  return `context=${formatTokenCount(context.estimatedInputTokens)}${suffix}`;
+}
+
+function formatProviderUsage(usage: TokenUsage | undefined): string {
+  if (!usage) {
+    return "provider usage=unavailable";
+  }
+
+  const parts = [
+    formatTokenPart("input", usage.inputTokens),
+    formatTokenPart("output", usage.outputTokens),
+    formatTokenPart("total", usage.totalTokens),
+    formatTokenPart("cache_read", usage.cacheReadInputTokens),
+    formatTokenPart("cache_create", usage.cacheCreationInputTokens)
+  ].filter((part): part is string => Boolean(part));
+
+  return parts.length > 0 ? `provider ${parts.join(" ")}` : "provider usage=unavailable";
+}
+
+function formatTokenPart(label: string, value: number | undefined): string | undefined {
+  return value === undefined ? undefined : `${label}=${formatTokenCount(value)}`;
+}
+
+function formatTokenCount(value: number): string {
+  return Intl.NumberFormat("en-US").format(value);
 }
 
 function parseToolset(value: string | undefined): CoreToolset {

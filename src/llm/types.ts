@@ -1,4 +1,4 @@
-import type { AgentMessage, AssistantMessage, JsonSchema, ReasoningOptions } from "../types.js";
+import type { AgentMessage, AssistantMessage, JsonSchema, ReasoningOptions, RequestContextMetadata } from "../types.js";
 
 export type LlmToolSpec = {
   name: string;
@@ -13,6 +13,11 @@ export type LlmRequest = {
   tools?: LlmToolSpec[];
   reasoning?: ReasoningOptions | false;
   signal?: AbortSignal;
+  metadata?: LlmRequestMetadata;
+};
+
+export type LlmRequestMetadata = {
+  context?: RequestContextMetadata;
 };
 
 export interface LlmClient {

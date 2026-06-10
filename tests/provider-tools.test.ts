@@ -96,6 +96,77 @@ test("OpenAI Chat client parses streamed tool-call arguments", async () => {
   });
 });
 
+test("OpenAI Chat client maps non-streaming usage", async () => {
+  const client = new OpenAIChatCompletionsClient({
+    apiKey: "test-key",
+    fetchImpl: async () =>
+      Response.json({
+        choices: [{ message: { content: "ok" } }],
+        usage: {
+          prompt_tokens: 21,
+          prompt_tokens_details: { cached_tokens: 4 },
+          completion_tokens: 8,
+          total_tokens: 29
+        }
+      })
+  });
+
+  const message = await client.complete({ model: "test-model", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(message.content, "ok");
+  assert.deepEqual(message.usage, {
+    inputTokens: 21,
+    outputTokens: 8,
+    totalTokens: 29,
+    cacheReadInputTokens: 4,
+    cacheCreationInputTokens: undefined
+  });
+});
+
+test("OpenAI Chat client requests and maps streaming usage chunk", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const sse = [
+    sseEvent({ choices: [{ delta: { content: "ok" } }], usage: null }),
+    sseEvent({
+      choices: [],
+      usage: {
+        prompt_tokens: 13,
+        prompt_tokens_details: { cached_tokens: 2 },
+        completion_tokens: 5,
+        total_tokens: 18
+      }
+    }),
+    "data: [DONE]\n\n"
+  ].join("");
+  const client = new OpenAIChatCompletionsClient({
+    apiKey: "test-key",
+    fetchImpl: async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return streamResponse(sse);
+    }
+  });
+
+  const events = [];
+  for await (const event of client.stream({ model: "test-model", messages: [{ role: "user", content: "hi" }] })) {
+    events.push(event);
+  }
+
+  assert.deepEqual(requestBody?.stream_options, { include_usage: true });
+  assert.equal(events.at(-1)?.type, "done");
+  const done = events.at(-1);
+  if (done?.type !== "done") {
+    throw new Error("Expected done event");
+  }
+  assert.equal(done.message.content, "ok");
+  assert.deepEqual(done.message.usage, {
+    inputTokens: 13,
+    outputTokens: 5,
+    totalTokens: 18,
+    cacheReadInputTokens: 2,
+    cacheCreationInputTokens: undefined
+  });
+});
+
 test("Anthropic client sends system prompt, tools, and tool results in Messages format", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const client = new AnthropicMessagesClient({
@@ -133,6 +204,33 @@ test("Anthropic client sends system prompt, tools, and tool results in Messages 
   assert.equal(tools[0]?.input_schema.type, "object");
 });
 
+test("Anthropic client maps non-streaming usage including cache tokens", async () => {
+  const client = new AnthropicMessagesClient({
+    apiKey: "test-key",
+    fetchImpl: async () =>
+      Response.json({
+        content: [{ type: "text", text: "ok" }],
+        usage: {
+          input_tokens: 10,
+          cache_creation_input_tokens: 3,
+          cache_read_input_tokens: 7,
+          output_tokens: 4
+        }
+      })
+  });
+
+  const message = await client.complete({ model: "claude-test", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(message.content, "ok");
+  assert.deepEqual(message.usage, {
+    inputTokens: 20,
+    outputTokens: 4,
+    totalTokens: 24,
+    cacheReadInputTokens: 7,
+    cacheCreationInputTokens: 3
+  });
+});
+
 test("Anthropic client parses streamed tool input deltas", async () => {
   const sse = [
     sseEvent({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "calculator", input: {} } }),
@@ -160,6 +258,58 @@ test("Anthropic client parses streamed tool input deltas", async () => {
     id: "toolu_1",
     name: "calculator",
     arguments: { expression: "3 + 4" }
+  });
+});
+
+test("Anthropic client maps streaming message_start and message_delta usage", async () => {
+  const sse = [
+    sseEvent({
+      type: "message_start",
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        content: [],
+        usage: {
+          input_tokens: 10,
+          cache_creation_input_tokens: 3,
+          cache_read_input_tokens: 7,
+          output_tokens: 1
+        }
+      }
+    }),
+    sseEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }),
+    sseEvent({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: {
+        output_tokens: 4
+      }
+    }),
+    sseEvent({ type: "message_stop" })
+  ].join("");
+  const client = new AnthropicMessagesClient({
+    apiKey: "test-key",
+    fetchImpl: async () => streamResponse(sse)
+  });
+
+  const events = [];
+  for await (const event of client.stream({ model: "claude-test", messages: [{ role: "user", content: "hi" }] })) {
+    events.push(event);
+  }
+
+  assert.equal(events.at(-1)?.type, "done");
+  const done = events.at(-1);
+  if (done?.type !== "done") {
+    throw new Error("Expected done event");
+  }
+  assert.equal(done.message.content, "ok");
+  assert.deepEqual(done.message.usage, {
+    inputTokens: 20,
+    outputTokens: 4,
+    totalTokens: 24,
+    cacheReadInputTokens: 7,
+    cacheCreationInputTokens: 3
   });
 });
 

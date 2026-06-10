@@ -1,6 +1,7 @@
-import type { AgentMessage, AssistantMessage, ReasoningOptions, ToolCall } from "../types.js";
+import type { AgentMessage, AssistantMessage, ReasoningOptions, TokenUsage, ToolCall } from "../types.js";
 import type { LlmProviderFactory, LlmRequest, LlmStreamEvent, LlmToolSpec, StreamingLlmClient } from "./types.js";
 import { parseServerSentEvents } from "./sse.js";
+import { cleanTokenUsage, mergeTokenUsage } from "./usage.js";
 
 type OpenAIChatCompletionsClientOptions = {
   apiKey?: string;
@@ -64,7 +65,17 @@ type ChatChoice = {
 
 type ChatCompletionsBody = {
   choices?: ChatChoice[];
+  usage?: ChatUsage | null;
   error?: { message?: string };
+};
+
+type ChatUsage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
 };
 
 type PendingToolCall = {
@@ -113,11 +124,15 @@ export class OpenAIChatCompletionsClient implements StreamingLlmClient {
 
     let content = "";
     let thinkingContent = "";
+    let usage: TokenUsage | undefined;
+    const rawEvents: ChatCompletionsBody[] = [];
     const toolCallsByIndex = new Map<number, PendingToolCall>();
     const toolCallsById = new Map<string, PendingToolCall>();
 
     for await (const rawEvent of parseServerSentEvents(response.body)) {
       const body = rawEvent as ChatCompletionsBody;
+      rawEvents.push(body);
+      usage = mergeTokenUsage(usage, usageFromChat(body.usage));
       const choice = body.choices?.[0];
       if (!choice?.delta) {
         continue;
@@ -166,7 +181,8 @@ export class OpenAIChatCompletionsClient implements StreamingLlmClient {
         content,
         reasoning: thinkingContent ? { summary: thinkingContent } : undefined,
         toolCalls: pendingToolCallsToToolCalls([...toolCallsByIndex.values()]),
-        raw: undefined
+        usage,
+        raw: rawEvents
       }
     };
   }
@@ -185,7 +201,8 @@ export class OpenAIChatCompletionsClient implements StreamingLlmClient {
       messages: toChatMessages(request.messages, request.systemPrompt),
       tools: request.tools && request.tools.length > 0 ? request.tools.map(toChatTool) : undefined,
       tool_choice: request.tools && request.tools.length > 0 ? "auto" : undefined,
-      stream
+      stream,
+      stream_options: stream ? { include_usage: true } : undefined
     };
 
     if (reasoning && reasoning.effort) {
@@ -270,8 +287,21 @@ function assistantFromBody(body: ChatCompletionsBody): AssistantMessage {
     content: message?.content ?? "",
     reasoning: reasoning ? { summary: reasoning } : undefined,
     toolCalls: message?.tool_calls ? chatToolCallsToToolCalls(message.tool_calls) : undefined,
+    usage: usageFromChat(body.usage),
     raw: body
   };
+}
+
+function usageFromChat(usage: ChatUsage | null | undefined): TokenUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  return cleanTokenUsage({
+    inputTokens: usage.prompt_tokens,
+    outputTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+    cacheReadInputTokens: usage.prompt_tokens_details?.cached_tokens
+  });
 }
 
 function chatToolCallsToToolCalls(toolCalls: ChatToolCall[]): ToolCall[] {

@@ -204,6 +204,341 @@ test("invalid tool arguments are returned as tool errors", async () => {
   assert.match(toolMessage.content, /must be a string/);
 });
 
+test("agent adds conversation background to the system prompt when created", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "ready"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    systemPrompt: "Base system prompt.",
+    tools: [calculatorTool],
+    background: {
+      cwd: "/workspace/project",
+      currentDate: "2026-06-09",
+      timezone: "Asia/Shanghai",
+      shell: "zsh"
+    }
+  });
+
+  await agent.run("hello");
+  const systemPrompt = llm.requests[0]?.systemPrompt ?? "";
+
+  assert.match(systemPrompt, /^You are Singularity/);
+  assert.match(systemPrompt, /Base system prompt\./);
+  assert.match(systemPrompt, /<environment_context>/);
+  assert.match(systemPrompt, /<cwd>\/workspace\/project<\/cwd>/);
+  assert.match(systemPrompt, /<current_date>2026-06-09<\/current_date>/);
+  assert.match(systemPrompt, /<timezone>Asia\/Shanghai<\/timezone>/);
+  assert.match(systemPrompt, /<shell>zsh<\/shell>/);
+  assert.match(systemPrompt, /<available_tools>/);
+  assert.match(systemPrompt, /<tool name="calculator" \/>/);
+});
+
+test("background false leaves the configured system prompt untouched", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "ready"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    systemPrompt: "Only this prompt.",
+    background: false
+  });
+
+  await agent.run("hello");
+
+  assert.equal(llm.requests[0]?.systemPrompt, "Only this prompt.");
+});
+
+test("agent creates a system prompt from background without a base prompt", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "ready"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    background: {
+      cwd: "/workspace/no-base",
+      currentDate: "2026-06-09",
+      includeTimezone: false,
+      includeShell: false,
+      includeTools: false
+    }
+  });
+
+  await agent.run("hello");
+  const systemPrompt = llm.requests[0]?.systemPrompt ?? "";
+
+  assert.match(systemPrompt, /^You are Singularity/);
+  assert.match(systemPrompt, /<environment_context>/);
+  assert.match(systemPrompt, /<cwd>\/workspace\/no-base<\/cwd>/);
+  assert.match(systemPrompt, /<current_date>2026-06-09<\/current_date>/);
+  assert.doesNotMatch(systemPrompt, /<available_tools>/);
+});
+
+test("agent applies context engine request view without mutating full history", async () => {
+  const longOutput = "a".repeat(400);
+  const longTool: AgentTool = {
+    name: "long_output",
+    description: "Return a long output",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      return { content: longOutput };
+    }
+  };
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_1", name: "long_output", arguments: {} }]
+    },
+    {
+      role: "assistant",
+      content: "done"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [longTool],
+    context: { maxToolResultTokens: 10 }
+  });
+
+  await agent.run("Use long tool");
+  const requestToolMessage = llm.requests[1]?.messages.at(-1);
+  const historyToolMessage = agent.history.find((message) => message.role === "tool");
+
+  assert.equal(requestToolMessage?.role, "tool");
+  assert.equal(historyToolMessage?.role, "tool");
+  if (requestToolMessage?.role !== "tool" || historyToolMessage?.role !== "tool") {
+    throw new Error("Expected tool messages");
+  }
+  assert.match(requestToolMessage.content, /ContextEngine truncated tool result/);
+  assert.equal(historyToolMessage.content, longOutput);
+});
+
+test("agent marks assistant usage from a non-compacted request as reusable", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "ready",
+      usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 }
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    context: { contextWindowTokens: 1000, reservedOutputTokens: 0 }
+  });
+
+  await agent.run("hello");
+
+  const assistant = agent.history.find((message) => message.role === "assistant");
+  assert.equal(assistant?.role, "assistant");
+  if (assistant?.role !== "assistant") {
+    throw new Error("Expected assistant message");
+  }
+  assert.equal(assistant.context?.requestCompacted, false);
+  assert.deepEqual(assistant.usage, { inputTokens: 8, outputTokens: 2, totalTokens: 10 });
+});
+
+test("agent marks assistant usage from a compacted request as non-reusable", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "handoff summary"
+    },
+    {
+      role: "assistant",
+      content: "ready",
+      usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 }
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    context: {
+      contextWindowTokens: 8,
+      reservedOutputTokens: 0,
+      keepRecentTokens: 1
+    }
+  });
+
+  await agent.run("this request should cross the tiny budget");
+
+  assert.deepEqual(llm.requests[0]?.tools, []);
+  assert.match(llm.requests[0]?.messages.at(-1)?.content ?? "", /context checkpoint compaction/i);
+  assert.equal(llm.requests[1]?.metadata?.context?.compacted, true);
+  const assistant = agent.history.find((message) => message.role === "assistant");
+  assert.equal(assistant?.role, "assistant");
+  if (assistant?.role !== "assistant") {
+    throw new Error("Expected assistant message");
+  }
+  assert.equal(assistant.context?.requestCompacted, true);
+});
+
+test("agent compacts by forking a one-shot no-tool summary and handing it back to history", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "First answer with important implementation detail."
+    },
+    {
+      role: "assistant",
+      content: "Summary: preserve the implementation detail and continue with the second request."
+    },
+    {
+      role: "assistant",
+      content: "continued from summary"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [calculatorTool],
+    context: false
+  });
+
+  await agent.run("First detailed request", { context: false });
+  await agent.run("Second request after history grows", {
+    context: {
+      contextWindowTokens: 12,
+      reservedOutputTokens: 0,
+      keepRecentTokens: 1
+    }
+  });
+
+  const summaryRequest = llm.requests[1];
+  assert.ok(summaryRequest);
+  assert.deepEqual(summaryRequest.tools, []);
+  assert.equal(summaryRequest.messages.some((message) => message.role === "assistant" && message.content.includes("important implementation detail")), true);
+  assert.match(summaryRequest.messages.at(-1)?.content ?? "", /context checkpoint compaction/i);
+
+  const compactedRequest = llm.requests[2];
+  assert.equal(compactedRequest?.metadata?.context?.compacted, true);
+  assert.equal(compactedRequest?.metadata?.context?.compactionSummarySource, "model");
+  assert.match(compactedRequest?.messages.at(-1)?.content ?? "", /Summary: preserve the implementation detail/);
+  assert.equal(agent.history.some((message) => message.role === "assistant" && message.content.includes("important implementation detail")), false);
+  assert.equal(agent.history.at(-1)?.role, "assistant");
+  assert.equal(agent.history.at(-1)?.content, "continued from summary");
+});
+
+test("agent emits request context metadata on turn_end", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "ready",
+      usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 }
+    }
+  ]);
+  const events: AgentEvent[] = [];
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    context: { contextWindowTokens: 1000, reservedOutputTokens: 0 },
+    onEvent(event) {
+      events.push(event);
+    }
+  });
+
+  await agent.run("hello");
+
+  const turnEnd = events.find((event) => event.type === "turn_end");
+  assert.equal(turnEnd?.type, "turn_end");
+  if (turnEnd?.type !== "turn_end") {
+    throw new Error("Expected turn_end event");
+  }
+  assert.equal(turnEnd.context?.compacted, false);
+  assert.equal(turnEnd.context?.tokenEstimateSource, "heuristic");
+  assert.equal(typeof turnEnd.context?.estimatedInputTokens, "number");
+});
+
+test("context false bypasses request-view truncation", async () => {
+  const longOutput = "b".repeat(400);
+  const longTool: AgentTool = {
+    name: "long_output",
+    description: "Return a long output",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      return { content: longOutput };
+    }
+  };
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_1", name: "long_output", arguments: {} }]
+    },
+    {
+      role: "assistant",
+      content: "done"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [longTool],
+    context: false
+  });
+
+  await agent.run("Use long tool", { context: false });
+  const requestToolMessage = llm.requests[1]?.messages.at(-1);
+
+  assert.equal(requestToolMessage?.role, "tool");
+  if (requestToolMessage?.role !== "tool") {
+    throw new Error("Expected tool message");
+  }
+  assert.equal(requestToolMessage.content, longOutput);
+});
+
+test("run-level context options can re-enable agent-level disabled context", async () => {
+  const longOutput = "c".repeat(400);
+  const longTool: AgentTool = {
+    name: "long_output",
+    description: "Return a long output",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      return { content: longOutput };
+    }
+  };
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_1", name: "long_output", arguments: {} }]
+    },
+    {
+      role: "assistant",
+      content: "done"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [longTool],
+    context: false
+  });
+
+  await agent.run("Use long tool", { context: { maxToolResultTokens: 10 } });
+  const requestToolMessage = llm.requests[1]?.messages.at(-1);
+
+  assert.equal(requestToolMessage?.role, "tool");
+  if (requestToolMessage?.role !== "tool") {
+    throw new Error("Expected tool message");
+  }
+  assert.match(requestToolMessage.content, /ContextEngine truncated tool result/);
+});
+
 test("agent forwards reasoning config and allows run-level override", async () => {
   const llm = new SequenceLlm([
     {
@@ -395,6 +730,79 @@ test("OpenAI Responses client parses SSE text and tool-call deltas", async () =>
     id: "call_1",
     name: "calculator",
     arguments: { expression: "2 + 2" }
+  });
+});
+
+test("OpenAI Responses client maps non-streaming usage", async () => {
+  const client = new OpenAIResponsesClient({
+    apiKey: "test-key",
+    fetchImpl: async () =>
+      Response.json({
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+        usage: {
+          input_tokens: 36,
+          input_tokens_details: { cached_tokens: 8 },
+          output_tokens: 12,
+          total_tokens: 48
+        }
+      })
+  });
+
+  const message = await client.complete({ model: "fake-model", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(message.content, "ok");
+  assert.deepEqual(message.usage, {
+    inputTokens: 36,
+    outputTokens: 12,
+    totalTokens: 48,
+    cacheReadInputTokens: 8,
+    cacheCreationInputTokens: undefined
+  });
+});
+
+test("OpenAI Responses client maps response.completed usage while streaming", async () => {
+  const sse = [
+    sseEvent({ type: "response.output_text.delta", delta: "ok" }),
+    sseEvent({
+      type: "response.completed",
+      response: {
+        usage: {
+          input_tokens: 11,
+          input_tokens_details: { cached_tokens: 3 },
+          output_tokens: 5,
+          total_tokens: 16
+        }
+      }
+    })
+  ].join("");
+
+  const client = new OpenAIResponsesClient({
+    apiKey: "test-key",
+    fetchImpl: async () =>
+      new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sse));
+          controller.close();
+        }
+      }))
+  });
+
+  const events = [];
+  for await (const event of client.stream({ model: "fake-model", messages: [{ role: "user", content: "hi" }] })) {
+    events.push(event);
+  }
+
+  assert.equal(events.at(-1)?.type, "done");
+  const done = events.at(-1);
+  if (done?.type !== "done") {
+    throw new Error("Expected done event");
+  }
+  assert.deepEqual(done.message.usage, {
+    inputTokens: 11,
+    outputTokens: 5,
+    totalTokens: 16,
+    cacheReadInputTokens: 3,
+    cacheCreationInputTokens: undefined
   });
 });
 

@@ -1,5 +1,6 @@
-import type { AgentMessage, AssistantMessage, ReasoningEffort, ReasoningOptions, ToolCall } from "../types.js";
+import type { AgentMessage, AssistantMessage, ReasoningEffort, ReasoningOptions, TokenUsage, ToolCall } from "../types.js";
 import type { LlmProviderFactory, LlmRequest, LlmStreamEvent, LlmToolSpec, StreamingLlmClient } from "./types.js";
+import { cleanTokenUsage } from "./usage.js";
 
 type OpenAIResponsesClientOptions = {
   apiKey?: string;
@@ -59,7 +60,17 @@ type ResolvedReasoning = {
 
 type ResponsesBody = {
   output?: ResponsesOutputItem[];
+  usage?: ResponsesUsage;
   error?: { message?: string };
+};
+
+type ResponsesUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  input_tokens_details?: {
+    cached_tokens?: number;
+  };
 };
 
 type ResponseStreamEvent = {
@@ -207,10 +218,11 @@ export class OpenAIResponsesClient implements StreamingLlmClient {
 
       if (event.type === "response.completed") {
         completed = true;
+        const responseBody = event.response;
         const message =
-          event.response?.output && event.response.output.length > 0
-            ? fromResponsesBody({ output: event.response.output })
-            : assistantMessageFromStream(content, thinkingContent, [...toolCalls.values()], rawEvents);
+          responseBody?.output && responseBody.output.length > 0
+            ? fromResponsesBody(responseBody)
+            : assistantMessageFromStream(content, thinkingContent, [...toolCalls.values()], rawEvents, responseBody?.usage);
         yield { type: "done", message };
       }
     }
@@ -336,6 +348,7 @@ function fromResponsesBody(body: ResponsesBody): AssistantMessage {
     content: contentParts.join(""),
     reasoning: reasoningParts.length > 0 ? { summary: reasoningParts.join("\n\n") } : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    usage: usageFromResponses(body.usage),
     raw: body
   };
 }
@@ -418,7 +431,8 @@ function assistantMessageFromStream(
   content: string,
   reasoningSummary: string,
   pendingToolCalls: PendingToolCall[],
-  rawEvents: ResponseStreamEvent[]
+  rawEvents: ResponseStreamEvent[],
+  usage?: ResponsesUsage
 ): AssistantMessage {
   const toolCalls = pendingToolCalls.map((toolCall) => ({
     id: toolCall.id,
@@ -431,8 +445,21 @@ function assistantMessageFromStream(
     content,
     reasoning: reasoningSummary ? { summary: reasoningSummary.trimEnd() } : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    usage: usageFromResponses(usage),
     raw: rawEvents
   };
+}
+
+function usageFromResponses(usage: ResponsesUsage | undefined): TokenUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  return cleanTokenUsage({
+    inputTokens: usage.input_tokens,
+    outputTokens: usage.output_tokens,
+    totalTokens: usage.total_tokens,
+    cacheReadInputTokens: usage.input_tokens_details?.cached_tokens
+  });
 }
 
 function reasoningTextFromItem(item: ResponsesOutputItem): string[] {

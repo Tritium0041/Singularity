@@ -1,3 +1,5 @@
+import type { ContextEngineOptions } from "./context/types.js";
+
 export type JsonSchema = {
   type?: string;
   properties?: Record<string, JsonSchema>;
@@ -21,6 +23,8 @@ export type AssistantMessage = {
   content: string;
   toolCalls?: ToolCall[];
   reasoning?: ReasoningOutput;
+  usage?: TokenUsage;
+  context?: AssistantContextMetadata;
   raw?: unknown;
 };
 
@@ -53,6 +57,27 @@ export type ReasoningOutput = {
   summary?: string;
 };
 
+export type TokenUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
+export type RequestContextMetadata = {
+  compacted?: boolean;
+  estimatedInputTokens?: number;
+  tokenEstimateSource?: "heuristic" | "provider_usage";
+  compactionDecisionEstimatedInputTokens?: number;
+  compactionDecisionTokenEstimateSource?: "heuristic" | "provider_usage";
+  compactionSummarySource?: "heuristic" | "model";
+};
+
+export type AssistantContextMetadata = {
+  requestCompacted?: boolean;
+};
+
 export type AgentEvent =
   | { type: "agent_start"; input: string }
   | { type: "turn_start"; turn: number }
@@ -62,7 +87,13 @@ export type AgentEvent =
   | { type: "message"; message: AgentMessage }
   | { type: "tool_start"; turn: number; toolCall: ToolCall }
   | { type: "tool_end"; turn: number; toolCall: ToolCall; result: ToolResultMessage }
-  | { type: "turn_end"; turn: number; message: AssistantMessage; toolResults: ToolResultMessage[] }
+  | {
+      type: "turn_end";
+      turn: number;
+      message: AssistantMessage;
+      toolResults: ToolResultMessage[];
+      context?: RequestContextMetadata;
+    }
   | { type: "agent_end"; result: AgentRunResult };
 
 export type AgentEventSink = (event: AgentEvent) => void | Promise<void>;
@@ -77,5 +108,6 @@ export type AgentRunResult = {
 export type AgentRunOptions = {
   maxTurns?: number;
   reasoning?: ReasoningOptions | false;
+  context?: false | Partial<ContextEngineOptions>;
   signal?: AbortSignal;
 };

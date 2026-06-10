@@ -7,6 +7,14 @@ import type {
   AssistantMessage,
   ReasoningOptions
 } from "../types.js";
+import {
+  mergeContextEngineOptions,
+  PromptBuilder,
+  type ContextEngineOptions,
+  type PromptFragment,
+  type SystemPromptBackgroundOptions,
+  ContextEngine
+} from "../context/index.js";
 import { isStreamingLlmClient, type LlmClient, type LlmRequest } from "../llm/types.js";
 import { ToolExecutor, ToolRegistry, type AgentTool, type ToolExecutionMode } from "../tools/registry.js";
 
@@ -18,6 +26,9 @@ export type AgentConfig = {
   toolExecution?: ToolExecutionMode;
   maxTurns?: number;
   reasoning?: ReasoningOptions | false;
+  context?: false | ContextEngineOptions;
+  background?: false | SystemPromptBackgroundOptions;
+  promptFragments?: readonly PromptFragment[];
   onEvent?: AgentEventSink;
 };
 
@@ -29,6 +40,7 @@ export class Agent {
   private readonly onEvent: AgentEventSink | undefined;
   private readonly toolExecution: ToolExecutionMode;
   private readonly reasoning: ReasoningOptions | false | undefined;
+  private readonly context: false | ContextEngineOptions | undefined;
   private readonly tools: ToolRegistry;
   private readonly executor: ToolExecutor;
   private readonly messages: AgentMessage[] = [];
@@ -36,13 +48,14 @@ export class Agent {
   constructor(config: AgentConfig) {
     this.llm = config.llm;
     this.model = config.model;
-    this.systemPrompt = config.systemPrompt;
     this.maxTurns = config.maxTurns ?? 8;
     this.onEvent = config.onEvent;
     this.toolExecution = config.toolExecution ?? "sequential";
     this.reasoning = config.reasoning;
+    this.context = config.context;
     this.tools = config.tools instanceof ToolRegistry ? config.tools : new ToolRegistry(config.tools ?? []);
     this.executor = new ToolExecutor(this.tools);
+    this.systemPrompt = this.buildSystemPrompt(config);
   }
 
   get history(): readonly AgentMessage[] {
@@ -88,14 +101,20 @@ export class Agent {
     for (let turn = 1; turn <= maxTurns; turn += 1) {
       await this.emit({ type: "turn_start", turn }, streamEventSink);
 
-      const assistant = await this.completeAssistant(turn, {
+      const rawRequest: LlmRequest = {
         model: this.model,
         systemPrompt: this.systemPrompt,
         messages: [...this.messages],
         tools: this.tools.toLlmToolSpecs(),
         reasoning: options.reasoning ?? this.reasoning,
         signal: options.signal
-      }, streamEventSink);
+      };
+      const prepared = await this.prepareRequest(rawRequest, options.context);
+      const request = prepared.request;
+      if (prepared.historyReplacement) {
+        this.messages.splice(0, this.messages.length, ...prepared.historyReplacement);
+      }
+      const assistant = this.withRequestContext(await this.completeAssistant(turn, request, streamEventSink), request);
       lastAssistant = assistant;
       this.messages.push(assistant);
       await this.emit({ type: "message", message: assistant }, streamEventSink);
@@ -103,7 +122,7 @@ export class Agent {
       const toolCalls = assistant.toolCalls ?? [];
       if (toolCalls.length === 0) {
         const result = this.buildResult(assistant.content, turn, "final");
-        await this.emit({ type: "turn_end", turn, message: assistant, toolResults: [] }, streamEventSink);
+        await this.emit({ type: "turn_end", turn, message: assistant, toolResults: [], context: request.metadata?.context }, streamEventSink);
         await this.emit({ type: "agent_end", result }, streamEventSink);
         return result;
       }
@@ -114,7 +133,7 @@ export class Agent {
       for (const message of toolResults) {
         await this.emit({ type: "message", message }, streamEventSink);
       }
-      await this.emit({ type: "turn_end", turn, message: assistant, toolResults }, streamEventSink);
+      await this.emit({ type: "turn_end", turn, message: assistant, toolResults, context: request.metadata?.context }, streamEventSink);
     }
 
     const result = this.buildResult(lastAssistant?.content ?? "", maxTurns, "max_turns");
@@ -163,6 +182,56 @@ export class Agent {
       throw new Error("Streaming LLM finished without a final message.");
     }
     return finalMessage;
+  }
+
+  private withRequestContext(message: AssistantMessage, request: LlmRequest): AssistantMessage {
+    const compacted = request.metadata?.context?.compacted;
+    if (compacted === undefined) {
+      return message;
+    }
+    return {
+      ...message,
+      context: {
+        ...message.context,
+        requestCompacted: compacted
+      }
+    };
+  }
+
+  private async prepareRequest(
+    request: LlmRequest,
+    runContext?: false | Partial<ContextEngineOptions>
+  ): Promise<{ request: LlmRequest; historyReplacement?: AgentMessage[] }> {
+    const contextOptions = mergeContextEngineOptions(this.context, runContext);
+    if (contextOptions === false) {
+      return { request };
+    }
+    return new ContextEngine(contextOptions).prepareWithHandoff(request, (summaryRequest) => this.llm.complete(summaryRequest));
+  }
+
+  private buildSystemPrompt(config: AgentConfig): string | undefined {
+    const background = this.buildBackgroundOptions(config.background);
+    return new PromptBuilder().buildConversationSystemPrompt({
+      basePrompt: config.systemPrompt,
+      defaultInstructions: config.background === false ? false : undefined,
+      background,
+      fragments: config.promptFragments
+    });
+  }
+
+  private buildBackgroundOptions(background: AgentConfig["background"]): false | SystemPromptBackgroundOptions {
+    if (background === false) {
+      return false;
+    }
+
+    return {
+      cwd: process.cwd(),
+      currentDate: new Date().toISOString().slice(0, 10),
+      timezone: resolveTimezone(),
+      shell: process.env.SHELL,
+      tools: this.tools.toLlmToolSpecs().map((tool) => ({ name: tool.name, description: tool.description })),
+      ...background
+    };
   }
 
   private async executeToolCalls(
@@ -274,5 +343,16 @@ class AsyncEventQueue<T> implements AsyncIterable<T> {
     return new Promise<IteratorResult<T>>((resolve, reject) => {
       this.waiters.push({ resolve, reject });
     });
+  }
+}
+
+function resolveTimezone(): string | undefined {
+  if (process.env.TZ) {
+    return process.env.TZ;
+  }
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch {
+    return undefined;
   }
 }

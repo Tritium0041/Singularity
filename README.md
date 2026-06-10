@@ -11,6 +11,7 @@ Singularity is a minimal TypeScript agent runtime for experimenting with LLM too
 - OpenAI Responses, OpenAI-compatible Chat Completions, and Anthropic Messages support.
 - Built-in basic, file, shell, and web/search tools.
 - Tool output truncation for large file, command, and URL results.
+- Context budgeting uses provider-reported token usage when available, then compacts long histories with a one-shot no-tool handoff summary.
 
 ## Requirements
 
@@ -98,9 +99,12 @@ const result = await agent.run("Calculate (123 + 456) * 789.");
 console.log(result.output);
 ```
 
+Agents automatically build a system prompt from Singularity's default coding-agent instructions, the configured `systemPrompt`, and a compact conversation background (`cwd`, date, timezone, shell, and enabled tool names). Override values through `background`, or set `background: false` for the exact system prompt string only.
+
 ## Project Structure
 
 - `src/agent`: the agent loop and event flow.
+- `src/context`: system prompt construction, token estimation, request-view truncation, and history compaction.
 - `src/llm`: LLM interfaces, provider registry, env factory, and provider clients.
 - `src/tools`: tool registry, executor, validation, built-in tools, and core tool factories.
 - `examples`: runnable agent demo.

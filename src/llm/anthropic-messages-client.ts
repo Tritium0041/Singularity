@@ -1,6 +1,7 @@
-import type { AgentMessage, AssistantMessage, ReasoningOptions, ToolCall, ToolResultMessage } from "../types.js";
+import type { AgentMessage, AssistantMessage, ReasoningOptions, TokenUsage, ToolCall, ToolResultMessage } from "../types.js";
 import type { LlmProviderFactory, LlmRequest, LlmStreamEvent, LlmToolSpec, StreamingLlmClient } from "./types.js";
 import { parseServerSentEvents } from "./sse.js";
+import { cleanTokenUsage, mergeTokenUsage } from "./usage.js";
 
 type AnthropicMessagesClientOptions = {
   apiKey?: string;
@@ -36,12 +37,23 @@ type AnthropicBody = {
     name?: string;
     input?: unknown;
   }>;
+  usage?: AnthropicUsage;
   error?: { message?: string };
+};
+
+type AnthropicUsage = {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
 };
 
 type AnthropicStreamEvent = {
   type?: string;
   index?: number;
+  message?: {
+    usage?: AnthropicUsage;
+  };
   content_block?: {
     type?: string;
     text?: string;
@@ -56,6 +68,7 @@ type AnthropicStreamEvent = {
     thinking?: string;
     partial_json?: string;
   };
+  usage?: AnthropicUsage;
 };
 
 type PendingToolCall = {
@@ -105,10 +118,14 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
     let content = "";
     let thinkingContent = "";
     let completed = false;
+    let usage: TokenUsage | undefined;
+    const rawEvents: AnthropicStreamEvent[] = [];
     const toolCallsByIndex = new Map<number, PendingToolCall>();
 
     for await (const rawEvent of parseServerSentEvents(response.body)) {
       const event = rawEvent as AnthropicStreamEvent;
+      rawEvents.push(event);
+      usage = mergeTokenUsage(usage, usageFromAnthropic(event.message?.usage), usageFromAnthropic(event.usage));
 
       if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
         const index = event.index ?? toolCallsByIndex.size;
@@ -164,12 +181,12 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
 
       if (event.type === "message_stop") {
         completed = true;
-        yield { type: "done", message: assistantFromStream(content, thinkingContent, [...toolCallsByIndex.values()]) };
+        yield { type: "done", message: assistantFromStream(content, thinkingContent, [...toolCallsByIndex.values()], usage, rawEvents) };
       }
     }
 
     if (!completed) {
-      yield { type: "done", message: assistantFromStream(content, thinkingContent, [...toolCallsByIndex.values()]) };
+      yield { type: "done", message: assistantFromStream(content, thinkingContent, [...toolCallsByIndex.values()], usage, rawEvents) };
     }
   }
 
@@ -303,11 +320,18 @@ function assistantFromBody(body: AnthropicBody): AssistantMessage {
     content: contentParts.join(""),
     reasoning: thinkingParts.length > 0 ? { summary: thinkingParts.join("\n\n") } : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    usage: usageFromAnthropic(body.usage),
     raw: body
   };
 }
 
-function assistantFromStream(content: string, thinkingContent: string, pendingToolCalls: PendingToolCall[]): AssistantMessage {
+function assistantFromStream(
+  content: string,
+  thinkingContent: string,
+  pendingToolCalls: PendingToolCall[],
+  usage: TokenUsage | undefined,
+  rawEvents: AnthropicStreamEvent[]
+): AssistantMessage {
   const toolCalls = pendingToolCalls.map((toolCall) => ({
     id: toolCall.id,
     name: toolCall.name,
@@ -319,8 +343,44 @@ function assistantFromStream(content: string, thinkingContent: string, pendingTo
     content,
     reasoning: thinkingContent ? { summary: thinkingContent } : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-    raw: undefined
+    usage,
+    raw: rawEvents
   };
+}
+
+function usageFromAnthropic(usage: AnthropicUsage | undefined): TokenUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  const baseInputTokens = tokenPart(usage.input_tokens);
+  const cacheReadInputTokens = tokenPart(usage.cache_read_input_tokens);
+  const cacheCreationInputTokens = tokenPart(usage.cache_creation_input_tokens);
+  const inputTokens = sumTokenParts(baseInputTokens, cacheReadInputTokens, cacheCreationInputTokens);
+  const outputTokens = tokenPart(usage.output_tokens);
+  return cleanTokenUsage({
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens !== undefined && outputTokens !== undefined ? inputTokens + outputTokens : undefined,
+    cacheReadInputTokens,
+    cacheCreationInputTokens
+  });
+}
+
+function tokenPart(value: number | null | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.ceil(value) : undefined;
+}
+
+function sumTokenParts(...values: Array<number | undefined>): number | undefined {
+  let total = 0;
+  let found = false;
+  for (const value of values) {
+    if (value === undefined) {
+      continue;
+    }
+    total += value;
+    found = true;
+  }
+  return found ? total : undefined;
 }
 
 function parseJsonObject(value: string): unknown {
