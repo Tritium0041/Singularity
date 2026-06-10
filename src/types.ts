@@ -1,4 +1,4 @@
-import type { ContextEngineOptions } from "./context/types.js";
+import type { ContextEngineOptions, ContextSummarySource } from "./context/types.js";
 
 export type JsonSchema = {
   type?: string;
@@ -65,6 +65,34 @@ export type TokenUsage = {
   cacheCreationInputTokens?: number;
 };
 
+export type RequestTokenEstimateMetadata = {
+  systemPromptTokens: number;
+  messageTokens: number;
+  toolTokens: number;
+  totalTokens: number;
+  source: "heuristic" | "provider_usage";
+  heuristicTotalTokens: number;
+  providerInputTokens?: number;
+  providerOutputTokens?: number;
+  appendedMessageTokens?: number;
+};
+
+export type ContextCompactionMetadata = {
+  mode: "automatic" | "manual";
+  summarySource: ContextSummarySource;
+  messageCountBefore: number;
+  messageCountAfter: number;
+  decision: RequestTokenEstimateMetadata;
+  compacted: RequestTokenEstimateMetadata;
+  summaryCall?: {
+    messageCount: number;
+    request: RequestTokenEstimateMetadata;
+    responseUsage?: TokenUsage;
+    summaryTokens: number;
+    summaryChars: number;
+  };
+};
+
 export type RequestContextMetadata = {
   compacted?: boolean;
   estimatedInputTokens?: number;
@@ -72,6 +100,8 @@ export type RequestContextMetadata = {
   compactionDecisionEstimatedInputTokens?: number;
   compactionDecisionTokenEstimateSource?: "heuristic" | "provider_usage";
   compactionSummarySource?: "heuristic" | "model";
+  estimate?: RequestTokenEstimateMetadata;
+  compaction?: ContextCompactionMetadata;
 };
 
 export type AssistantContextMetadata = {
@@ -110,4 +140,16 @@ export type AgentRunOptions = {
   reasoning?: ReasoningOptions | false;
   context?: false | Partial<ContextEngineOptions>;
   signal?: AbortSignal;
+};
+
+export type AgentCompactOptions = {
+  reasoning?: ReasoningOptions | false;
+  context?: false | Partial<ContextEngineOptions>;
+  signal?: AbortSignal;
+};
+
+export type AgentCompactResult = {
+  compacted: boolean;
+  messages: AgentMessage[];
+  context?: RequestContextMetadata;
 };

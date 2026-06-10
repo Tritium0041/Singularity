@@ -1,6 +1,8 @@
 import type {
   AgentEvent,
   AgentEventSink,
+  AgentCompactOptions,
+  AgentCompactResult,
   AgentMessage,
   AgentRunOptions,
   AgentRunResult,
@@ -64,6 +66,43 @@ export class Agent {
 
   async run(input: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
     return this.runInternal(input, options);
+  }
+
+  async compactHistory(options: AgentCompactOptions = {}): Promise<AgentCompactResult> {
+    if (this.messages.length === 0) {
+      return {
+        compacted: false,
+        messages: []
+      };
+    }
+
+    const contextOptions = mergeContextEngineOptions(this.context, options.context);
+    if (contextOptions === false) {
+      return {
+        compacted: false,
+        messages: [...this.messages]
+      };
+    }
+
+    const rawRequest: LlmRequest = {
+      model: this.model,
+      systemPrompt: this.systemPrompt,
+      messages: [...this.messages],
+      tools: this.tools.toLlmToolSpecs(),
+      reasoning: options.reasoning ?? this.reasoning,
+      signal: options.signal
+    };
+    const prepared = await new ContextEngine(contextOptions).compactWithHandoff(rawRequest, (summaryRequest) =>
+      this.llm.complete(summaryRequest)
+    );
+    const replacement = prepared.historyReplacement ?? prepared.request.messages;
+    this.messages.splice(0, this.messages.length, ...replacement);
+
+    return {
+      compacted: prepared.request.metadata?.context?.compacted === true,
+      messages: [...this.messages],
+      context: prepared.request.metadata?.context
+    };
   }
 
   async *runEvents(input: string, options: AgentRunOptions = {}): AsyncIterable<AgentEvent> {

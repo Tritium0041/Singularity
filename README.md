@@ -38,11 +38,27 @@ npm run build
 LLM_API_KEY=your_key_here npm run demo
 ```
 
-You can pass a custom prompt:
+The demo opens a small terminal chat UI. Each message keeps the same agent history, and the status line shows current provider token totals plus the latest context estimate. When context compaction runs, the demo prints the pre-compaction decision estimate, summary-call usage, and post-compaction context estimate.
+
+You can pass an initial prompt and continue chatting:
 
 ```sh
 LLM_API_KEY=your_key_here npm run demo -- "What is (123 + 456) * 789?"
 ```
+
+Use `--once` for the old single-prompt behavior:
+
+```sh
+LLM_API_KEY=your_key_here npm run demo -- --once "What is (123 + 456) * 789?"
+```
+
+Interactive commands:
+
+- `/usage`: show current session token usage and latest context estimate.
+- `/compact`: manually summarize and compact the current conversation history.
+- `/new`: reset conversation history and usage counters.
+- `/clear`: clear the terminal view.
+- `/exit`: quit the demo.
 
 Optional environment variables:
 

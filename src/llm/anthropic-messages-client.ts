@@ -90,7 +90,7 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
     this.baseURL = trimTrailingSlash(options.baseURL ?? process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com/v1");
     this.defaultModel = options.defaultModel ?? process.env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-latest";
     this.defaultReasoning = options.defaultReasoning;
-    this.defaultMaxTokens = options.defaultMaxTokens ?? 4096;
+    this.defaultMaxTokens = options.defaultMaxTokens ?? 20000;
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 

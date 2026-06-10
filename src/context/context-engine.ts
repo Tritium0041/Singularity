@@ -1,9 +1,9 @@
-import type { AgentMessage, AssistantMessage } from "../types.js";
+import type { AgentMessage, AssistantMessage, ContextCompactionMetadata, RequestTokenEstimateMetadata } from "../types.js";
 import type { LlmRequest } from "../llm/types.js";
 import { BudgetManager, resolveContextEngineOptions } from "./budget-manager.js";
 import { CONTEXT_HANDOFF_SUMMARY_PROMPT, HistoryCompressor } from "./history-compressor.js";
 import { PromptBuilder } from "./prompt-builder.js";
-import { estimateRequestTokens } from "./token-estimator.js";
+import { estimateRequestTokens, estimateTextTokens, type RequestTokenEstimate } from "./token-estimator.js";
 import type { ContextEngineOptions, ContextSummarySource, ResolvedContextEngineOptions } from "./types.js";
 
 export type SummaryModel = (request: LlmRequest) => Promise<AssistantMessage>;
@@ -33,6 +33,10 @@ export class ContextEngine {
     return summarize ? this.prepareInternal(request, summarize) : this.prepareInternal(request);
   }
 
+  async compactWithHandoff(request: LlmRequest, summarize?: SummaryModel): Promise<PreparedContextRequest> {
+    return this.compactInternal(request, summarize, "manual");
+  }
+
   private prepareSync(request: LlmRequest): PreparedContextRequest {
     return this.prepareInternal(request);
   }
@@ -47,19 +51,45 @@ export class ContextEngine {
       return { request };
     }
 
-    const requestWithTruncatedTools: LlmRequest = {
-      ...request,
-      systemPrompt: this.promptBuilder.buildSystemPrompt(request.systemPrompt),
-      messages: this.compressor.truncateToolResults(request.messages)
-    };
-
+    const requestWithTruncatedTools = this.buildRequestView(request);
     const estimate = estimateRequestTokens(requestWithTruncatedTools);
     if (!this.budget.shouldCompact(estimate.totalTokens)) {
       return { request: withContextMetadata(requestWithTruncatedTools, false, estimate) };
     }
 
+    return this.compactRequestView(requestWithTruncatedTools, estimate, summarize, "automatic");
+  }
+
+  private async compactInternal(
+    request: LlmRequest,
+    summarize: SummaryModel | undefined,
+    mode: ContextCompactionMetadata["mode"]
+  ): Promise<PreparedContextRequest> {
+    if (!this.options.enabled) {
+      return { request };
+    }
+
+    const requestWithTruncatedTools = this.buildRequestView(request);
+    const estimate = estimateRequestTokens(requestWithTruncatedTools);
+    return this.compactRequestView(requestWithTruncatedTools, estimate, summarize, mode);
+  }
+
+  private buildRequestView(request: LlmRequest): LlmRequest {
+    return {
+      ...request,
+      systemPrompt: this.promptBuilder.buildSystemPrompt(request.systemPrompt),
+      messages: this.compressor.truncateToolResults(request.messages)
+    };
+  }
+
+  private compactRequestView(
+    requestWithTruncatedTools: LlmRequest,
+    estimate: RequestTokenEstimate,
+    summarize: SummaryModel | undefined,
+    mode: ContextCompactionMetadata["mode"]
+  ): PreparedContextRequest | Promise<PreparedContextRequest> {
     if (summarize && this.options.summarizeHistory) {
-      return this.prepareWithModelSummary(requestWithTruncatedTools, estimate, summarize);
+      return this.prepareWithModelSummary(requestWithTruncatedTools, estimate, summarize, mode);
     }
 
     const compactedRequest: LlmRequest = {
@@ -67,27 +97,55 @@ export class ContextEngine {
       messages: this.compressor.compact(requestWithTruncatedTools.messages)
     };
     const compactedEstimate = estimateRequestTokens(compactedRequest, { useProviderUsage: false });
+    const compaction = buildCompactionMetadata({
+      mode,
+      summarySource: "heuristic",
+      requestBefore: requestWithTruncatedTools,
+      requestAfter: compactedRequest,
+      decisionEstimate: estimate,
+      compactedEstimate
+    });
     return {
-      request: withContextMetadata(compactedRequest, true, compactedEstimate, estimate, "heuristic")
+      request: withContextMetadata(compactedRequest, true, compactedEstimate, estimate, "heuristic", compaction)
     };
   }
 
   private async prepareWithModelSummary(
     request: LlmRequest,
     compactionDecisionEstimate: ReturnType<typeof estimateRequestTokens>,
-    summarize: SummaryModel
+    summarize: SummaryModel,
+    mode: ContextCompactionMetadata["mode"]
   ): Promise<PreparedContextRequest> {
+    const compactionPlan = this.compressor.planCompaction(request.messages);
     const summaryRequest = buildSummaryRequest(request);
+    const summaryRequestEstimate = estimateRequestTokens(summaryRequest);
     const summaryMessage = await summarize(summaryRequest);
-    const compactedMessages = this.compressor.compactWithHandoffSummary(request.messages, summaryMessage.content);
+    const compactedMessages = this.compressor.compactWithHandoffSummary(request.messages, summaryMessage.content, {
+      plan: compactionPlan
+    });
     const compactedRequest: LlmRequest = {
       ...request,
       messages: compactedMessages
     };
     const compactedEstimate = estimateRequestTokens(compactedRequest, { useProviderUsage: false });
+    const compaction = buildCompactionMetadata({
+      mode,
+      summarySource: "model",
+      requestBefore: request,
+      requestAfter: compactedRequest,
+      decisionEstimate: compactionDecisionEstimate,
+      compactedEstimate,
+      summaryCall: {
+        messageCount: summaryRequest.messages.length,
+        request: toEstimateMetadata(summaryRequestEstimate),
+        responseUsage: summaryMessage.usage,
+        summaryTokens: estimateTextTokens(summaryMessage.content),
+        summaryChars: summaryMessage.content.length
+      }
+    });
     return {
-      request: withContextMetadata(compactedRequest, true, compactedEstimate, compactionDecisionEstimate, "model"),
-      historyReplacement: compactedMessages
+      request: withContextMetadata(compactedRequest, true, compactedEstimate, compactionDecisionEstimate, "model", compaction),
+      historyReplacement: mode === "manual" ? compactedMessages : undefined
     };
   }
 }
@@ -111,7 +169,8 @@ function withContextMetadata(
   compacted: boolean,
   estimate: ReturnType<typeof estimateRequestTokens>,
   compactionDecisionEstimate?: ReturnType<typeof estimateRequestTokens>,
-  summarySource?: ContextSummarySource
+  summarySource?: ContextSummarySource,
+  compaction?: ContextCompactionMetadata
 ): LlmRequest {
   return {
     ...request,
@@ -124,8 +183,44 @@ function withContextMetadata(
         tokenEstimateSource: estimate.source,
         compactionDecisionEstimatedInputTokens: compactionDecisionEstimate?.totalTokens,
         compactionDecisionTokenEstimateSource: compactionDecisionEstimate?.source,
-        compactionSummarySource: summarySource
+        compactionSummarySource: summarySource,
+        estimate: toEstimateMetadata(estimate),
+        compaction
       }
     }
+  };
+}
+
+function buildCompactionMetadata(options: {
+  mode: ContextCompactionMetadata["mode"];
+  summarySource: ContextSummarySource;
+  requestBefore: LlmRequest;
+  requestAfter: LlmRequest;
+  decisionEstimate: RequestTokenEstimate;
+  compactedEstimate: RequestTokenEstimate;
+  summaryCall?: ContextCompactionMetadata["summaryCall"];
+}): ContextCompactionMetadata {
+  return {
+    mode: options.mode,
+    summarySource: options.summarySource,
+    messageCountBefore: options.requestBefore.messages.length,
+    messageCountAfter: options.requestAfter.messages.length,
+    decision: toEstimateMetadata(options.decisionEstimate),
+    compacted: toEstimateMetadata(options.compactedEstimate),
+    summaryCall: options.summaryCall
+  };
+}
+
+function toEstimateMetadata(estimate: RequestTokenEstimate): RequestTokenEstimateMetadata {
+  return {
+    systemPromptTokens: estimate.systemPromptTokens,
+    messageTokens: estimate.messageTokens,
+    toolTokens: estimate.toolTokens,
+    totalTokens: estimate.totalTokens,
+    source: estimate.source,
+    heuristicTotalTokens: estimate.heuristicTotalTokens,
+    providerInputTokens: estimate.providerInputTokens,
+    providerOutputTokens: estimate.providerOutputTokens,
+    appendedMessageTokens: estimate.appendedMessageTokens
   };
 }

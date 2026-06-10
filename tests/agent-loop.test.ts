@@ -387,7 +387,7 @@ test("agent marks assistant usage from a compacted request as non-reusable", asy
   assert.equal(assistant.context?.requestCompacted, true);
 });
 
-test("agent compacts by forking a one-shot no-tool summary and handing it back to history", async () => {
+test("agent automatically compacts with a full-history summary while preserving the current goal", async () => {
   const llm = new SequenceLlm([
     {
       role: "assistant",
@@ -395,7 +395,8 @@ test("agent compacts by forking a one-shot no-tool summary and handing it back t
     },
     {
       role: "assistant",
-      content: "Summary: preserve the implementation detail and continue with the second request."
+      content: "Summary: preserve the implementation detail and continue with the second request.",
+      usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 }
     },
     {
       role: "assistant",
@@ -427,10 +428,132 @@ test("agent compacts by forking a one-shot no-tool summary and handing it back t
   const compactedRequest = llm.requests[2];
   assert.equal(compactedRequest?.metadata?.context?.compacted, true);
   assert.equal(compactedRequest?.metadata?.context?.compactionSummarySource, "model");
-  assert.match(compactedRequest?.messages.at(-1)?.content ?? "", /Summary: preserve the implementation detail/);
-  assert.equal(agent.history.some((message) => message.role === "assistant" && message.content.includes("important implementation detail")), false);
+  assert.equal(compactedRequest?.metadata?.context?.compaction?.mode, "automatic");
+  assert.equal(compactedRequest?.metadata?.context?.compaction?.summaryCall?.responseUsage?.totalTokens, 25);
+  assert.ok((compactedRequest?.metadata?.context?.compaction?.summaryCall?.summaryTokens ?? 0) > 0);
+  assert.equal(typeof compactedRequest?.metadata?.context?.compaction?.decision.totalTokens, "number");
+  assert.equal(typeof compactedRequest?.metadata?.context?.compaction?.compacted.messageTokens, "number");
+  assert.equal(compactedRequest?.tools?.[0]?.name, "calculator");
+  assert.match(compactedRequest?.systemPrompt ?? "", /<available_tools>/);
+  assert.equal(compactedRequest?.messages[0]?.content, "First detailed request");
+  assert.match(compactedRequest?.messages[1]?.content ?? "", /Summary: preserve the implementation detail/);
+  assert.equal(compactedRequest?.messages.at(-1)?.content, "Second request after history grows");
+  assert.equal(compactedRequest?.messages.some((message) => message.role === "assistant" && message.content.includes("important implementation detail")), false);
+  assert.equal(agent.history.some((message) => message.role === "assistant" && message.content.includes("important implementation detail")), true);
   assert.equal(agent.history.at(-1)?.role, "assistant");
   assert.equal(agent.history.at(-1)?.content, "continued from summary");
+});
+
+test("automatic compaction preserves the live tool-call turn and tool guidance", async () => {
+  const longOutput = "tool-result-".repeat(260);
+  const longTool: AgentTool = {
+    name: "long_output",
+    description: "Return a long output",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      return { content: longOutput };
+    }
+  };
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_1", name: "long_output", arguments: {} }]
+    },
+    {
+      role: "assistant",
+      content: "Summary: keep the live tool result available."
+    },
+    {
+      role: "assistant",
+      content: "done"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [longTool],
+    context: false
+  });
+
+  await agent.run("Use long tool", {
+    context: {
+      contextWindowTokens: 1000,
+      reservedOutputTokens: 0,
+      keepRecentTokens: 1,
+      maxToolResultTokens: 1000
+    }
+  });
+
+  const summaryRequest = llm.requests[1];
+  assert.ok(summaryRequest);
+  assert.deepEqual(summaryRequest.tools, []);
+  assert.equal(summaryRequest.messages.some((message) => message.role === "tool" && message.content === longOutput), true);
+
+  const compactedRequest = llm.requests[2];
+  assert.equal(compactedRequest?.metadata?.context?.compacted, true);
+  assert.equal(compactedRequest?.tools?.[0]?.name, "long_output");
+  assert.match(compactedRequest?.systemPrompt ?? "", /<available_tools>/);
+  assert.match(compactedRequest?.messages[0]?.content ?? "", /Summary: keep the live tool result/);
+
+  const retainedUser = compactedRequest?.messages.find((message) => message.role === "user" && message.content === "Use long tool");
+  const retainedAssistant = compactedRequest?.messages.find((message) => message.role === "assistant" && message.toolCalls?.[0]?.id === "call_1");
+  const retainedTool = compactedRequest?.messages.find((message) => message.role === "tool" && message.toolCallId === "call_1");
+  assert.ok(retainedUser);
+  assert.ok(retainedAssistant);
+  assert.ok(retainedTool);
+  assert.ok((compactedRequest?.messages.findIndex((message) => message === retainedUser) ?? -1) < (compactedRequest?.messages.findIndex((message) => message === retainedAssistant) ?? -1));
+  assert.ok((compactedRequest?.messages.findIndex((message) => message === retainedAssistant) ?? -1) < (compactedRequest?.messages.findIndex((message) => message === retainedTool) ?? -1));
+  assert.equal(compactedRequest?.messages.at(-1), retainedTool);
+
+  const historyTool = agent.history.find((message) => message.role === "tool");
+  assert.equal(historyTool?.role, "tool");
+  assert.equal(historyTool?.content, longOutput);
+});
+
+test("agent can manually compact current history", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "First answer with important implementation detail."
+    },
+    {
+      role: "assistant",
+      content: "Second answer kept as recent context."
+    },
+    {
+      role: "assistant",
+      content: "Manual summary: preserve the implementation detail.",
+      usage: { inputTokens: 18, outputTokens: 4, totalTokens: 22 }
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [calculatorTool],
+    context: false
+  });
+
+  await agent.run("First detailed request", { context: false });
+  await agent.run("Second detailed request", { context: false });
+  const result = await agent.compactHistory({
+    context: {
+      contextWindowTokens: 1000,
+      reservedOutputTokens: 0,
+      keepRecentTokens: 1
+    }
+  });
+
+  assert.equal(result.compacted, true);
+  assert.equal(result.context?.compaction?.mode, "manual");
+  assert.equal(result.context?.compaction?.summaryCall?.responseUsage?.totalTokens, 22);
+  assert.deepEqual(llm.requests[2]?.tools, []);
+  assert.match(llm.requests[2]?.messages.at(-1)?.content ?? "", /context checkpoint compaction/i);
+  assert.equal(agent.history[0]?.role, "user");
+  assert.equal(agent.history[0]?.content, "First detailed request");
+  assert.match(agent.history[1]?.content ?? "", /Manual summary/);
+  assert.equal(agent.history.some((message) => message.role === "assistant" && message.content.includes("important implementation detail")), false);
+  assert.equal(agent.history.at(-1)?.content, "Second answer kept as recent context.");
 });
 
 test("agent emits request context metadata on turn_end", async () => {

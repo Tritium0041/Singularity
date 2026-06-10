@@ -185,7 +185,7 @@ test("execute_command tool result truncation keeps the tail", () => {
   assert.ok(preparedToolMessage.content.endsWith("-tail"));
 });
 
-test("context engine inserts context summary when history exceeds budget", () => {
+test("context engine preserves user instructions and drops old model/tool messages when history exceeds budget", () => {
   const request: LlmRequest = {
     model: "fake-model",
     messages: [
@@ -208,9 +208,10 @@ test("context engine inserts context summary when history exceeds budget", () =>
   }).prepare(request);
 
   assert.equal(prepared.messages[0]?.role, "user");
-  assert.match(prepared.messages[0]?.content ?? "", /<context_summary>/);
-  assert.match(prepared.messages[0]?.content ?? "", /Original goal/);
-  assert.match(prepared.messages[0]?.content ?? "", /read_file path=src\/agent\/agent-loop.ts/);
+  assert.equal(prepared.messages[0]?.content, "Original goal: inspect the context files and design the engine.");
+  assert.equal(prepared.messages.some((message) => message.role === "assistant"), false);
+  assert.equal(prepared.messages.some((message) => message.role === "tool"), false);
+  assert.equal(prepared.messages.some((message) => message.content.includes("src/agent/agent-loop.ts")), false);
   assert.equal(prepared.messages.at(-1)?.role, "user");
   assert.equal(prepared.messages.at(-1)?.content, "Continue with the current implementation.");
 });
@@ -242,7 +243,9 @@ test("context engine compacts when provider-calibrated usage crosses budget", ()
   assert.equal(prepared.metadata?.context?.compactionDecisionTokenEstimateSource, "provider_usage");
   assert.ok((prepared.metadata?.context?.compactionDecisionEstimatedInputTokens ?? 0) > 27);
   assert.equal(prepared.messages[0]?.role, "user");
-  assert.match(prepared.messages[0]?.content ?? "", /<context_summary>/);
+  assert.equal(prepared.messages[0]?.content, "Original provider-counted request.");
+  assert.equal(prepared.messages.some((message) => message.role === "assistant"), false);
+  assert.equal(prepared.messages.some((message) => message.role === "tool"), false);
   assert.equal(prepared.messages.at(-1)?.content, "Continue.");
 });
 
@@ -270,7 +273,69 @@ test("context compaction keeps assistant tool calls paired with tool results", (
   const retainedAssistant = prepared.messages.find((message) => message.role === "assistant" && message.toolCalls?.[0]?.id === "call_2");
   const retainedTool = prepared.messages.find((message) => message.role === "tool" && message.toolCallId === "call_2");
 
+  assert.equal(prepared.messages[0]?.role, "user");
+  assert.equal(prepared.messages[0]?.content, "Old task.");
+  assert.equal(prepared.messages.some((message) => message.role === "assistant" && message.content === "Old answer."), false);
   assert.ok(retainedAssistant);
   assert.ok(retainedTool);
   assert.ok(prepared.messages.findIndex((message) => message === retainedAssistant) < prepared.messages.findIndex((message) => message === retainedTool));
+});
+
+test("model handoff compaction summarizes full history and preserves recent complete turns", async () => {
+  let summaryRequest: LlmRequest | undefined;
+  const request: LlmRequest = {
+    model: "fake-model",
+    systemPrompt: "Use tools when useful.",
+    messages: [
+      { role: "user", content: "Old task with important setup." },
+      { role: "assistant", content: "Old answer with implementation detail." },
+      { role: "user", content: "Current goal: calculate the result with the calculator." },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "call_2", name: "calculator", arguments: { expression: "2 + 2" } }]
+      },
+      { role: "tool", toolCallId: "call_2", toolName: "calculator", content: "4" }
+    ],
+    tools: [
+      {
+        name: "calculator",
+        description: "Evaluate arithmetic",
+        parameters: { type: "object", properties: { expression: { type: "string" } }, required: ["expression"] }
+      }
+    ]
+  };
+
+  const prepared = await new ContextEngine({
+    contextWindowTokens: 16,
+    reservedOutputTokens: 0,
+    keepRecentTokens: 1
+  }).prepareWithHandoff(request, async (nextSummaryRequest) => {
+    summaryRequest = nextSummaryRequest;
+    return { role: "assistant", content: "Summary: preserve old setup." };
+  });
+
+  assert.ok(summaryRequest);
+  assert.deepEqual(summaryRequest?.tools, []);
+  assert.equal(summaryRequest?.messages.some((message) => message.content.includes("Old task")), true);
+  assert.equal(summaryRequest?.messages.some((message) => message.content.includes("Current goal")), true);
+  assert.match(summaryRequest?.messages.at(-1)?.content ?? "", /context checkpoint compaction/i);
+
+  assert.equal(prepared.request.systemPrompt, "Use tools when useful.");
+  assert.equal(prepared.request.tools?.[0]?.name, "calculator");
+  assert.equal(prepared.request.messages[0]?.role, "user");
+  assert.equal(prepared.request.messages[0]?.content, "Old task with important setup.");
+  assert.equal(prepared.request.messages[1]?.role, "user");
+  assert.match(prepared.request.messages[1]?.content ?? "", /Context checkpoint summary/);
+  assert.equal(prepared.request.messages.some((message) => message.content.includes("Old answer with implementation detail")), false);
+
+  const retainedUser = prepared.request.messages.find((message) => message.role === "user" && message.content.includes("Current goal"));
+  const retainedAssistant = prepared.request.messages.find((message) => message.role === "assistant" && message.toolCalls?.[0]?.id === "call_2");
+  const retainedTool = prepared.request.messages.find((message) => message.role === "tool" && message.toolCallId === "call_2");
+  assert.ok(retainedUser);
+  assert.ok(retainedAssistant);
+  assert.ok(retainedTool);
+  assert.ok(prepared.request.messages.findIndex((message) => message === retainedUser) < prepared.request.messages.findIndex((message) => message === retainedAssistant));
+  assert.ok(prepared.request.messages.findIndex((message) => message === retainedAssistant) < prepared.request.messages.findIndex((message) => message === retainedTool));
+  assert.equal(prepared.request.messages.at(-1), retainedTool);
 });

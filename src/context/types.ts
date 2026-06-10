@@ -5,7 +5,6 @@ export type ContextEngineOptions = {
   reservedOutputTokens?: number;
   keepRecentTokens?: number;
   maxToolResultTokens?: number;
-  maxHandoffUserMessageTokens?: number;
   summarizeHistory?: boolean;
 };
 

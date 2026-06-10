@@ -7,7 +7,6 @@ export const DEFAULT_CONTEXT_ENGINE_OPTIONS: ResolvedContextEngineOptions = {
   reservedOutputTokens: 16000,
   keepRecentTokens: 20000,
   maxToolResultTokens: 4000,
-  maxHandoffUserMessageTokens: 20000,
   summarizeHistory: true
 };
 
