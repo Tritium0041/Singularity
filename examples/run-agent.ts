@@ -1,18 +1,23 @@
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import {
   Agent,
   createCoreTools,
   createLlmClientFromEnv,
+  type ContextEngineOptions,
   type AgentEvent,
   type ContextCompactionMetadata,
   type CoreToolset,
+  type EnvLlmClient,
+  type ReasoningEffort,
   type RequestContextMetadata,
   type RequestTokenEstimateMetadata,
   type TokenUsage
 } from "../src/index.js";
 
 const DEFAULT_PROMPT = "Calculate (123 + 456) * 789, then tell me the result.";
+const CONFIG_PATH = ".agent-demo.json";
 
 type CliOptions = {
   help: boolean;
@@ -35,6 +40,60 @@ type SessionUsageSnapshot = {
   providerUsage?: TokenUsage;
 };
 
+type DemoConfig = {
+  provider?: string;
+  model?: string;
+  apiKey?: string;
+  baseURL?: string;
+  toolset?: CoreToolset;
+  maxTurns?: number;
+  reasoningEffort?: ReasoningEffort;
+  compressionProvider?: string;
+  compressionModel?: string;
+  compressionApiKey?: string;
+  compressionBaseURL?: string;
+  tavilyApiKey?: string;
+  dynamicCompression?: boolean;
+  dynamicAutoSummarize?: boolean;
+  dynamicTriggerTokens?: number;
+  dynamicKeepRecentTokens?: number;
+  dynamicMinMessages?: number;
+  contextWindowTokens?: number;
+  reservedOutputTokens?: number;
+  keepRecentTokens?: number;
+  maxToolResultTokens?: number;
+  compactionThresholdRatio?: number;
+  summarizeHistory?: boolean;
+};
+
+type DemoConfigKey = keyof DemoConfig;
+
+const CONFIG_KEY_HELP: Record<DemoConfigKey, string> = {
+  provider: "main provider: openai-responses, openai-chat, anthropic",
+  model: "main model name",
+  apiKey: "main provider API key, stored locally if saved",
+  baseURL: "main provider base URL",
+  toolset: "basic, files, shell, web, all",
+  maxTurns: "positive integer max turns per prompt",
+  reasoningEffort: "minimal, low, medium, high, xhigh",
+  compressionProvider: "compression provider override",
+  compressionModel: "compression model override",
+  compressionApiKey: "compression provider API key",
+  compressionBaseURL: "compression provider base URL",
+  tavilyApiKey: "Tavily API key for the web_search tool",
+  dynamicCompression: "true/false enable dynamic compression",
+  dynamicAutoSummarize: "true/false enable background summary fallback",
+  dynamicTriggerTokens: "positive integer trigger threshold",
+  dynamicKeepRecentTokens: "positive integer recent context budget",
+  dynamicMinMessages: "positive integer minimum stale messages",
+  contextWindowTokens: "positive integer context window estimate",
+  reservedOutputTokens: "positive integer reserved output budget",
+  keepRecentTokens: "positive integer fallback compaction recent budget",
+  maxToolResultTokens: "positive integer tool-result truncation budget",
+  compactionThresholdRatio: "number between 0 and 1",
+  summarizeHistory: "true/false use model handoff summaries"
+};
+
 class SessionUsageLedger {
   private providerUsage: TokenUsage = {};
   private providerUsageTurns = 0;
@@ -47,6 +106,7 @@ class SessionUsageLedger {
     this.assistantTurns += 1;
     this.latestContext = event.context;
     this.recordCompactionUsage(event.context?.compaction);
+    this.recordDynamicCompressionUsage(event.context?.dynamicCompression);
 
     if (event.message.usage) {
       this.recordProviderUsage(event.message.usage);
@@ -90,6 +150,20 @@ class SessionUsageLedger {
     this.usageUnavailableCalls += 1;
   }
 
+  private recordDynamicCompressionUsage(dynamicCompression: RequestContextMetadata["dynamicCompression"]): void {
+    const summaryCall = dynamicCompression?.summaryCall;
+    if (!summaryCall) {
+      return;
+    }
+
+    if (summaryCall.responseUsage) {
+      this.recordProviderUsage(summaryCall.responseUsage);
+      return;
+    }
+
+    this.usageUnavailableCalls += 1;
+  }
+
   private recordProviderUsage(usage: TokenUsage): void {
     this.providerUsageTurns += 1;
     this.providerUsage = addTokenUsage(this.providerUsage, usage);
@@ -103,9 +177,11 @@ if (cli.help) {
   process.exit(0);
 }
 
-const llm = createLlmClientFromEnv();
-const toolset = parseToolset(process.env.AGENT_TOOLSET);
-const maxTurns = parseOptionalPositiveInteger(process.env.AGENT_MAX_TURNS, "AGENT_MAX_TURNS");
+let demoConfig = loadDemoConfig();
+let llm = createMainLlmClient();
+let compressionLlm = createCompressionLlmClient(llm);
+let toolset = resolveToolset();
+let maxTurns = resolveMaxTurns();
 let displayState = createDisplayState();
 let usageLedger = new SessionUsageLedger();
 let exchangeCount = 0;
@@ -129,14 +205,16 @@ function createDemoAgent(): Agent {
   return new Agent({
     llm: llm.llm,
     model: llm.model,
-    reasoning: process.env.AGENT_REASONING_EFFORT
-      ? {
-          effort: process.env.AGENT_REASONING_EFFORT as "minimal" | "low" | "medium" | "high" | "xhigh",
-          summary: "auto"
-        }
-      : undefined,
+    compressionLlm: compressionLlm?.llm,
+    compressionModel: compressionLlm?.model,
+    reasoning: resolveReasoning(),
     systemPrompt: "You are a concise assistant. Use tools when useful, then answer the user.",
-    tools: createCoreTools({ rootDir: process.cwd(), toolset }),
+    tools: createCoreTools({
+      rootDir: process.cwd(),
+      toolset,
+      web: { apiKey: demoConfig.tavilyApiKey }
+    }),
+    context: buildContextOptions(),
     onEvent(event) {
       if (event.type === "turn_start") {
         displayState.turnStreamedThinking = false;
@@ -244,6 +322,10 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
     console.log(formatSessionStatus());
     return "handled";
   }
+  if (input === "/config" || input.startsWith("/config ")) {
+    await handleConfigCommand(input);
+    return "handled";
+  }
   if (input === "/compact") {
     await runManualCompaction();
     return "handled";
@@ -265,6 +347,101 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
     return "handled";
   }
   return "message";
+}
+
+async function handleConfigCommand(input: string): Promise<void> {
+  try {
+    await runConfigCommand(input);
+  } catch (error) {
+    console.error(`[config:error] ${formatError(error)}`);
+  }
+}
+
+async function runConfigCommand(input: string): Promise<void> {
+  const [, subcommand = "show", ...args] = input.split(/\s+/);
+  const normalized = subcommand.toLowerCase();
+
+  if (normalized === "show" || normalized === "list") {
+    printConfig();
+    return;
+  }
+
+  if (normalized === "help") {
+    printConfigHelp();
+    return;
+  }
+
+  if (normalized === "keys") {
+    printConfigKeys();
+    return;
+  }
+
+  if (normalized === "set") {
+    const key = normalizeConfigKey(args[0]);
+    const rawValue = args.slice(1).join(" ").trim();
+    if (!key || rawValue.length === 0) {
+      console.log("[config] usage: /config set <key> <value>");
+      return;
+    }
+    demoConfig = {
+      ...demoConfig,
+      [key]: parseConfigValue(key, rawValue)
+    };
+    saveDemoConfig(demoConfig);
+    reloadRuntimeFromConfig();
+    console.log(`[config] set ${key}=${formatConfigValue(key, demoConfig[key])}`);
+    console.log("[config] saved and applied; conversation reset");
+    return;
+  }
+
+  if (normalized === "unset") {
+    const key = normalizeConfigKey(args[0]);
+    if (!key) {
+      console.log("[config] usage: /config unset <key>");
+      return;
+    }
+    const next = { ...demoConfig };
+    delete next[key];
+    demoConfig = next;
+    saveDemoConfig(demoConfig);
+    reloadRuntimeFromConfig();
+    console.log(`[config] unset ${key}`);
+    console.log("[config] saved and applied; conversation reset");
+    return;
+  }
+
+  if (normalized === "save") {
+    saveDemoConfig(demoConfig);
+    console.log(`[config] saved ${CONFIG_PATH}`);
+    return;
+  }
+
+  if (normalized === "reload") {
+    demoConfig = loadDemoConfig();
+    reloadRuntimeFromConfig();
+    console.log(`[config] reloaded ${CONFIG_PATH}; conversation reset`);
+    return;
+  }
+
+  if (normalized === "reset") {
+    demoConfig = {};
+    saveDemoConfig(demoConfig);
+    reloadRuntimeFromConfig();
+    console.log(`[config] reset ${CONFIG_PATH}; conversation reset`);
+    return;
+  }
+
+  console.log(`[config] unknown subcommand: ${subcommand}. Try /config help.`);
+}
+
+function reloadRuntimeFromConfig(): void {
+  llm = createMainLlmClient();
+  compressionLlm = createCompressionLlmClient(llm);
+  toolset = resolveToolset();
+  maxTurns = resolveMaxTurns();
+  usageLedger = new SessionUsageLedger();
+  exchangeCount = 0;
+  agent = createDemoAgent();
 }
 
 async function runManualCompaction(): Promise<void> {
@@ -292,9 +469,12 @@ async function runManualCompaction(): Promise<void> {
 function renderBanner(mode: "tui" | "one-shot"): void {
   console.log("Singularity agent demo");
   console.log(`mode=${mode} provider=${llm.provider} model=${llm.model}`);
+  if (compressionLlm) {
+    console.log(`compression_provider=${compressionLlm.provider} compression_model=${compressionLlm.model}`);
+  }
   console.log(`toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
   if (mode === "tui") {
-    console.log("commands=/help /usage /compact /new /clear /exit");
+    console.log("commands=/help /usage /config /compact /new /clear /exit");
   }
 }
 
@@ -309,18 +489,91 @@ Environment:
   AGENT_TOOLSET=basic|files|shell|web|all
   AGENT_MAX_TURNS=<positive integer>
   AGENT_REASONING_EFFORT=minimal|low|medium|high|xhigh
+  AGENT_COMPRESSION_PROVIDER, AGENT_COMPRESSION_MODEL
+  AGENT_DYNAMIC_COMPRESSION=1
 
 Interactive commands:
-  /usage, /compact, /new, /clear, /exit`);
+  /usage, /config, /compact, /new, /clear, /exit`);
 }
 
 function printTuiHelp(): void {
   console.log(`Commands:
   /usage  show current provider token totals and latest context estimate
+  /config show current config and change runtime settings
   /compact manually summarize and compact the current conversation history
   /new    reset conversation history and usage counters
   /clear  clear the terminal view
   /exit   quit the demo`);
+}
+
+function printConfigHelp(): void {
+  console.log(`Config commands:
+  /config
+  /config show
+  /config keys
+  /config set <key> <value>
+  /config unset <key>
+  /config reload
+  /config reset
+
+Examples:
+  /config set provider openai-chat
+  /config set model qwen3
+  /config set baseURL http://localhost:11434/v1
+  /config set apiKey ollama
+  /config set toolset all
+  /config set maxTurns 12
+  /config set tavilyApiKey tvly-dev-...
+  /config set dynamicCompression true
+  /config set compressionModel gpt-4.1-mini`);
+}
+
+function printConfigKeys(): void {
+  for (const key of Object.keys(CONFIG_KEY_HELP) as DemoConfigKey[]) {
+    console.log(`${key.padEnd(26)} ${CONFIG_KEY_HELP[key]}`);
+  }
+}
+
+function printConfig(): void {
+  console.log(`[config] file=${CONFIG_PATH}`);
+  console.log(`[config] provider=${llm.provider} model=${llm.model}`);
+  if (compressionLlm) {
+    console.log(`[config] compressionProvider=${compressionLlm.provider} compressionModel=${compressionLlm.model}`);
+  } else {
+    console.log("[config] compressionProvider=(main) compressionModel=(main)");
+  }
+  console.log(`[config] toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
+  const context = buildContextOptions();
+  console.log(`[config] dynamicCompression=${context?.dynamicCompression ? "true" : "false"}`);
+
+  const saved = cleanConfig(demoConfig);
+  const savedKeys = Object.keys(saved) as DemoConfigKey[];
+  if (savedKeys.length === 0) {
+    console.log("[config] saved overrides: none");
+    return;
+  }
+
+  console.log("[config] saved overrides:");
+  for (const key of savedKeys) {
+    console.log(`  ${key}=${formatConfigValue(key, saved[key])}`);
+  }
+}
+
+function formatConfigValue(key: DemoConfigKey, value: DemoConfig[DemoConfigKey]): string {
+  if (value === undefined) {
+    return "(unset)";
+  }
+  if (key === "apiKey" || key === "compressionApiKey" || key === "tavilyApiKey") {
+    return maskSecret(String(value));
+  }
+  return String(value);
+}
+
+function maskSecret(value: string): string {
+  if (value.length <= 8) {
+    return "***";
+  }
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }
 
 function formatTurnTokenUsage(
@@ -407,6 +660,9 @@ function formatRequestContext(context: RequestContextMetadata | undefined): stri
   if (context.compactionSummarySource) {
     notes.push(`summary=${context.compactionSummarySource}`);
   }
+  if (context.dynamicCompression?.applied) {
+    notes.push(context.dynamicCompression.generated ? "dynamic=new" : "dynamic=reused");
+  }
   if (context.compactionDecisionEstimatedInputTokens !== undefined) {
     const source = context.compactionDecisionTokenEstimateSource ? ` ${context.compactionDecisionTokenEstimateSource}` : "";
     notes.push(`decision=${formatTokenCount(context.compactionDecisionEstimatedInputTokens)}${source}`);
@@ -414,6 +670,232 @@ function formatRequestContext(context: RequestContextMetadata | undefined): stri
 
   const suffix = notes.length > 0 ? ` (${notes.join(", ")})` : "";
   return `context=${formatTokenCount(context.estimatedInputTokens)}${suffix}`;
+}
+
+function createMainLlmClient(): EnvLlmClient {
+  return createLlmClientFromEnv({
+    provider: demoConfig.provider,
+    model: demoConfig.model,
+    apiKey: demoConfig.apiKey,
+    baseURL: demoConfig.baseURL
+  });
+}
+
+function createCompressionLlmClient(main: EnvLlmClient): EnvLlmClient | undefined {
+  const provider = firstNonEmpty(demoConfig.compressionProvider, process.env.AGENT_COMPRESSION_PROVIDER);
+  const model = firstNonEmpty(demoConfig.compressionModel, process.env.AGENT_COMPRESSION_MODEL);
+  const usesMainProvider = resolvesToProvider(provider, main.provider);
+  const apiKey = firstNonEmpty(demoConfig.compressionApiKey, usesMainProvider ? demoConfig.apiKey : undefined);
+  const baseURL = firstNonEmpty(demoConfig.compressionBaseURL, usesMainProvider ? demoConfig.baseURL : undefined);
+  if (!provider && !model && !apiKey && !baseURL) {
+    return undefined;
+  }
+
+  return createLlmClientFromEnv({
+    provider: provider ?? main.provider,
+    model: model ?? main.model,
+    apiKey,
+    baseURL
+  });
+}
+
+function resolvesToProvider(value: string | undefined, provider: EnvLlmClient["provider"]): boolean {
+  if (!value) {
+    return true;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (provider === "openai-responses") {
+    return normalized === "openai" || normalized === "responses" || normalized === "openai-responses";
+  }
+  if (provider === "openai-chat") {
+    return (
+      normalized === "chat" ||
+      normalized === "openai-chat" ||
+      normalized === "openai-compatible" ||
+      normalized === "openai-completions" ||
+      normalized === "chat-completions"
+    );
+  }
+  return normalized === "anthropic" || normalized === "anthropic-messages" || normalized === "claude";
+}
+
+function resolveToolset(): CoreToolset {
+  return demoConfig.toolset ?? parseToolset(process.env.AGENT_TOOLSET);
+}
+
+function resolveMaxTurns(): number | undefined {
+  return demoConfig.maxTurns ?? parseOptionalPositiveInteger(process.env.AGENT_MAX_TURNS, "AGENT_MAX_TURNS");
+}
+
+function resolveReasoning() {
+  const effort = demoConfig.reasoningEffort ?? parseReasoningEffort(process.env.AGENT_REASONING_EFFORT, "AGENT_REASONING_EFFORT");
+  return effort ? { effort, summary: "auto" as const } : undefined;
+}
+
+function buildContextOptions(): ContextEngineOptions | undefined {
+  const context: ContextEngineOptions = {
+    contextWindowTokens: demoConfig.contextWindowTokens,
+    reservedOutputTokens: demoConfig.reservedOutputTokens,
+    keepRecentTokens: demoConfig.keepRecentTokens,
+    maxToolResultTokens: demoConfig.maxToolResultTokens,
+    compactionThresholdRatio: demoConfig.compactionThresholdRatio,
+    summarizeHistory: demoConfig.summarizeHistory,
+    dynamicCompression: parseDynamicCompressionOptions()
+  };
+
+  const hasContextValue = Object.values(context).some((value) => value !== undefined && value !== false);
+  return hasContextValue ? context : undefined;
+}
+
+function parseDynamicCompressionOptions(): ContextEngineOptions["dynamicCompression"] {
+  const enabled = demoConfig.dynamicCompression ?? isEnabled(process.env.AGENT_DYNAMIC_COMPRESSION);
+  if (!enabled) {
+    return undefined;
+  }
+
+  return {
+    enabled: true,
+    autoSummarize: demoConfig.dynamicAutoSummarize ?? isEnabled(process.env.AGENT_DYNAMIC_AUTO_SUMMARIZE),
+    triggerTokens: demoConfig.dynamicTriggerTokens ?? parseOptionalPositiveInteger(process.env.AGENT_DYNAMIC_TRIGGER_TOKENS, "AGENT_DYNAMIC_TRIGGER_TOKENS"),
+    keepRecentTokens: demoConfig.dynamicKeepRecentTokens ?? parseOptionalPositiveInteger(process.env.AGENT_DYNAMIC_KEEP_RECENT_TOKENS, "AGENT_DYNAMIC_KEEP_RECENT_TOKENS"),
+    minCompressMessages: demoConfig.dynamicMinMessages ?? parseOptionalPositiveInteger(process.env.AGENT_DYNAMIC_MIN_MESSAGES, "AGENT_DYNAMIC_MIN_MESSAGES")
+  };
+}
+
+function loadDemoConfig(): DemoConfig {
+  if (!existsSync(CONFIG_PATH)) {
+    return {};
+  }
+
+  const raw = readFileSync(CONFIG_PATH, "utf8").trim();
+  if (!raw) {
+    return {};
+  }
+
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid ${CONFIG_PATH}: expected a JSON object.`);
+  }
+
+  const config: DemoConfig = {};
+  for (const [rawKey, rawValue] of Object.entries(parsed)) {
+    const key = normalizeConfigKey(rawKey);
+    if (!key) {
+      continue;
+    }
+    config[key] = parseConfigValue(key, rawValue);
+  }
+  return config;
+}
+
+function saveDemoConfig(config: DemoConfig): void {
+  const cleaned = cleanConfig(config);
+  writeFileSync(CONFIG_PATH, `${JSON.stringify(cleaned, null, 2)}\n`, "utf8");
+}
+
+function cleanConfig(config: DemoConfig): DemoConfig {
+  const cleaned: DemoConfig = {};
+  for (const key of Object.keys(CONFIG_KEY_HELP) as DemoConfigKey[]) {
+    const value = config[key];
+    if (value !== undefined) {
+      cleaned[key] = value as never;
+    }
+  }
+  return cleaned;
+}
+
+function normalizeConfigKey(value: string | undefined): DemoConfigKey | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim().replace(/[-_](.)/g, (_, char: string) => char.toUpperCase());
+  return (Object.keys(CONFIG_KEY_HELP) as DemoConfigKey[]).find((key) => key.toLowerCase() === normalized.toLowerCase());
+}
+
+function parseConfigValue(key: DemoConfigKey, value: unknown): never {
+  if (isStringKey(key)) {
+    if (typeof value !== "string") {
+      throw new Error(`Invalid ${key}: expected a string.`);
+    }
+    return value.trim() as never;
+  }
+
+  if (key === "toolset") {
+    return parseToolset(String(value)) as never;
+  }
+
+  if (key === "reasoningEffort") {
+    const effort = parseReasoningEffort(String(value), key);
+    if (!effort) {
+      throw new Error(`Invalid ${key}: expected minimal, low, medium, high, or xhigh.`);
+    }
+    return effort as never;
+  }
+
+  if (isBooleanKey(key)) {
+    return parseBooleanConfig(value, key) as never;
+  }
+
+  if (key === "compactionThresholdRatio") {
+    return parseRatioConfig(value, key) as never;
+  }
+
+  return parsePositiveIntegerConfig(value, key) as never;
+}
+
+function isStringKey(key: DemoConfigKey): boolean {
+  return key === "provider" || key === "model" || key === "apiKey" || key === "baseURL" || key === "compressionProvider" || key === "compressionModel" || key === "compressionApiKey" || key === "compressionBaseURL" || key === "tavilyApiKey";
+}
+
+function isBooleanKey(key: DemoConfigKey): boolean {
+  return key === "dynamicCompression" || key === "dynamicAutoSummarize" || key === "summarizeHistory";
+}
+
+function parseBooleanConfig(value: unknown, key: string): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1" || normalized === "on" || normalized === "yes") {
+      return true;
+    }
+    if (normalized === "false" || normalized === "0" || normalized === "off" || normalized === "no") {
+      return false;
+    }
+  }
+  throw new Error(`Invalid ${key}: expected true or false.`);
+}
+
+function parsePositiveIntegerConfig(value: unknown, key: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`Invalid ${key}: expected a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseRatioConfig(value: unknown, key: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    throw new Error(`Invalid ${key}: expected a number between 0 and 1.`);
+  }
+  return parsed;
+}
+
+function isEnabled(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "on" || normalized === "yes";
+}
+
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+  return values.find((value) => value !== undefined && value.trim().length > 0);
 }
 
 function formatProviderUsage(label: string, usage: TokenUsage | undefined): string {
@@ -513,6 +995,16 @@ function parseToolset(value: string | undefined): CoreToolset {
     return value;
   }
   throw new Error(`Invalid AGENT_TOOLSET: ${value}. Expected basic, files, shell, web, or all.`);
+}
+
+function parseReasoningEffort(value: string | undefined, name: string): ReasoningEffort | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh") {
+    return value;
+  }
+  throw new Error(`Invalid ${name}: ${value}. Expected minimal, low, medium, high, or xhigh.`);
 }
 
 function parseOptionalPositiveInteger(value: string | undefined, name: string): number | undefined {

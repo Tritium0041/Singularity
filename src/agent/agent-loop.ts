@@ -10,19 +10,36 @@ import type {
   ReasoningOptions
 } from "../types.js";
 import {
+  applyDynamicCompressionWorkerResult,
+  buildDynamicCompressionWorkerRequest,
+  createDynamicCompressionState,
+  DYNAMIC_COMPRESSION_TOOL_NAME,
   mergeContextEngineOptions,
   PromptBuilder,
   type ContextEngineOptions,
+  type DynamicCompressionCompactToolArgs,
+  type DynamicCompressionState,
   type PromptFragment,
+  type ResolvedContextEngineOptions,
   type SystemPromptBackgroundOptions,
   ContextEngine
 } from "../context/index.js";
 import { isStreamingLlmClient, type LlmClient, type LlmRequest } from "../llm/types.js";
 import { ToolExecutor, ToolRegistry, type AgentTool, type ToolExecutionMode } from "../tools/registry.js";
 
+type PreparedAgentRequest = {
+  request: LlmRequest;
+  historyReplacement?: AgentMessage[];
+  registry: ToolRegistry;
+  executor: ToolExecutor;
+};
+
 export type AgentConfig = {
   llm: LlmClient;
   model: string;
+  compressionLlm?: LlmClient;
+  compressionModel?: string;
+  compressionReasoning?: ReasoningOptions | false;
   systemPrompt?: string;
   tools?: AgentTool[] | ToolRegistry;
   toolExecution?: ToolExecutionMode;
@@ -37,6 +54,9 @@ export type AgentConfig = {
 export class Agent {
   private readonly llm: LlmClient;
   private readonly model: string;
+  private readonly compressionLlm: LlmClient | undefined;
+  private readonly compressionModel: string | undefined;
+  private readonly compressionReasoning: ReasoningOptions | false | undefined;
   private readonly systemPrompt: string | undefined;
   private readonly maxTurns: number;
   private readonly onEvent: AgentEventSink | undefined;
@@ -44,19 +64,22 @@ export class Agent {
   private readonly reasoning: ReasoningOptions | false | undefined;
   private readonly context: false | ContextEngineOptions | undefined;
   private readonly tools: ToolRegistry;
-  private readonly executor: ToolExecutor;
   private readonly messages: AgentMessage[] = [];
+  private readonly dynamicCompressionState: DynamicCompressionState;
 
   constructor(config: AgentConfig) {
     this.llm = config.llm;
     this.model = config.model;
+    this.compressionLlm = config.compressionLlm;
+    this.compressionModel = config.compressionModel;
+    this.compressionReasoning = config.compressionReasoning;
     this.maxTurns = config.maxTurns ?? 8;
     this.onEvent = config.onEvent;
     this.toolExecution = config.toolExecution ?? "sequential";
     this.reasoning = config.reasoning;
     this.context = config.context;
     this.tools = config.tools instanceof ToolRegistry ? config.tools : new ToolRegistry(config.tools ?? []);
-    this.executor = new ToolExecutor(this.tools);
+    this.dynamicCompressionState = getInitialDynamicCompressionState(config.context);
     this.systemPrompt = this.buildSystemPrompt(config);
   }
 
@@ -76,7 +99,7 @@ export class Agent {
       };
     }
 
-    const contextOptions = mergeContextEngineOptions(this.context, options.context);
+    const contextOptions = this.resolveContextOptions(options.context);
     if (contextOptions === false) {
       return {
         compacted: false,
@@ -92,9 +115,7 @@ export class Agent {
       reasoning: options.reasoning ?? this.reasoning,
       signal: options.signal
     };
-    const prepared = await new ContextEngine(contextOptions).compactWithHandoff(rawRequest, (summaryRequest) =>
-      this.llm.complete(summaryRequest)
-    );
+    const prepared = await new ContextEngine(contextOptions).compactWithHandoff(rawRequest, (summaryRequest) => this.completeCompression(summaryRequest));
     const replacement = prepared.historyReplacement ?? prepared.request.messages;
     this.messages.splice(0, this.messages.length, ...replacement);
 
@@ -166,7 +187,7 @@ export class Agent {
         return result;
       }
 
-      const toolResults = await this.executeToolCalls(turn, toolCalls, options.signal, streamEventSink);
+      const toolResults = await this.executeToolCalls(turn, toolCalls, prepared.registry, prepared.executor, options.signal, streamEventSink);
 
       this.messages.push(...toolResults);
       for (const message of toolResults) {
@@ -240,12 +261,64 @@ export class Agent {
   private async prepareRequest(
     request: LlmRequest,
     runContext?: false | Partial<ContextEngineOptions>
-  ): Promise<{ request: LlmRequest; historyReplacement?: AgentMessage[] }> {
-    const contextOptions = mergeContextEngineOptions(this.context, runContext);
+  ): Promise<PreparedAgentRequest> {
+    const contextOptions = this.resolveContextOptions(runContext);
+    const registry = this.buildRuntimeToolRegistry(contextOptions);
+    const executor = new ToolExecutor(registry);
+    const requestWithRuntimeTools: LlmRequest = {
+      ...request,
+      tools: registry.toLlmToolSpecs()
+    };
     if (contextOptions === false) {
-      return { request };
+      return { request: requestWithRuntimeTools, registry, executor };
     }
-    return new ContextEngine(contextOptions).prepareWithHandoff(request, (summaryRequest) => this.llm.complete(summaryRequest));
+    const prepared = await new ContextEngine(contextOptions).prepareWithHandoff(requestWithRuntimeTools, (summaryRequest) => this.completeCompression(summaryRequest));
+    if (contextOptions.dynamicCompression) {
+      contextOptions.dynamicCompression.state.workerBaseRequest = prepared.request;
+    }
+    return {
+      ...prepared,
+      registry,
+      executor
+    };
+  }
+
+  private completeCompression(request: LlmRequest): Promise<AssistantMessage> {
+    return (this.compressionLlm ?? this.llm).complete(request);
+  }
+
+  private resolveContextOptions(runContext?: false | Partial<ContextEngineOptions>): false | ResolvedContextEngineOptions {
+    const merged = mergeContextEngineOptions(this.context, runContext);
+    if (merged === false) {
+      return false;
+    }
+
+    return {
+      ...merged,
+      compressionModel: merged.compressionModel ?? this.compressionModel,
+      compressionReasoning: merged.compressionReasoning ?? this.compressionReasoning,
+      dynamicCompression: merged.dynamicCompression
+        ? {
+            ...merged.dynamicCompression,
+            state: this.dynamicCompressionState
+          }
+        : false
+    };
+  }
+
+  private buildRuntimeToolRegistry(contextOptions: false | ResolvedContextEngineOptions): ToolRegistry {
+    const tools = this.tools.list();
+    if (contextOptions !== false && contextOptions.dynamicCompression && contextOptions.dynamicCompression.exposeTool && !this.tools.get(DYNAMIC_COMPRESSION_TOOL_NAME)) {
+      tools.push(
+        createDynamicCompressionTool({
+          state: this.dynamicCompressionState,
+          model: contextOptions.compressionModel ?? this.model,
+          reasoning: contextOptions.compressionReasoning ?? this.reasoning,
+          complete: (request) => this.completeCompression(request)
+        })
+      );
+    }
+    return new ToolRegistry(tools);
   }
 
   private buildSystemPrompt(config: AgentConfig): string | undefined {
@@ -276,18 +349,20 @@ export class Agent {
   private async executeToolCalls(
     turn: number,
     toolCalls: NonNullable<AssistantMessage["toolCalls"]>,
+    registry: ToolRegistry,
+    executor: ToolExecutor,
     signal?: AbortSignal,
     streamEventSink?: AgentEventSink
   ) {
     const mustRunSequentially =
       this.toolExecution === "sequential" ||
-      toolCalls.some((toolCall) => this.tools.get(toolCall.name)?.executionMode === "sequential");
+      toolCalls.some((toolCall) => registry.get(toolCall.name)?.executionMode === "sequential");
 
     if (mustRunSequentially) {
       const results = [];
       for (const toolCall of toolCalls) {
         await this.emit({ type: "tool_start", turn, toolCall }, streamEventSink);
-        const result = await this.executor.execute(toolCall, signal);
+        const result = await executor.execute(toolCall, signal);
         results.push(result);
         await this.emit({ type: "tool_end", turn, toolCall, result }, streamEventSink);
       }
@@ -300,7 +375,7 @@ export class Agent {
 
     const results = await Promise.all(
       toolCalls.map(async (toolCall) => {
-        const result = await this.executor.execute(toolCall, signal);
+        const result = await executor.execute(toolCall, signal);
         await this.emit({ type: "tool_end", turn, toolCall, result }, streamEventSink);
         return result;
       })
@@ -385,6 +460,75 @@ class AsyncEventQueue<T> implements AsyncIterable<T> {
   }
 }
 
+function createDynamicCompressionTool(options: {
+  state: DynamicCompressionState;
+  model: string;
+  reasoning?: ReasoningOptions | false;
+  complete: (request: LlmRequest) => Promise<AssistantMessage>;
+}): AgentTool {
+  return {
+    name: DYNAMIC_COMPRESSION_TOOL_NAME,
+    description: "Offload context compaction to a side worker that selects stale closed message ranges, summarizes them, and installs reusable summary blocks.",
+    executionMode: "sequential",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        goal: {
+          type: "string",
+          description: "Optional guidance for the compression worker about what context pressure or task phase to optimize for."
+        },
+        targetTokenBudget: {
+          type: "integer",
+          description: "Optional target token budget after compression."
+        },
+        maxBlocks: {
+          type: "integer",
+          description: "Maximum number of closed ranges the worker should summarize in this pass."
+        }
+      }
+    },
+    async execute(args, context) {
+      const compactArgs = args as DynamicCompressionCompactToolArgs;
+      const request = buildDynamicCompressionWorkerRequest({
+        state: options.state,
+        model: options.model,
+        reasoning: options.reasoning,
+        signal: context.signal,
+        goal: compactArgs.goal,
+        targetTokenBudget: compactArgs.targetTokenBudget,
+        maxBlocks: compactArgs.maxBlocks
+      });
+      const response = await options.complete(request);
+      const results = applyDynamicCompressionWorkerResult(options.state, response.content);
+      if (results.length === 0) {
+        return {
+          content: "Compression worker found no closed context ranges safe to summarize.",
+          details: {
+            responseUsage: response.usage
+          }
+        };
+      }
+
+      return {
+        content: `Compression worker installed ${results.length} summary block(s): ${results.map((result) => result.block.ref).join(", ")}.`,
+        details: {
+          blocks: results.map((result) => ({
+            blockId: result.block.id,
+            blockRef: result.block.ref,
+            startId: result.block.startId,
+            endId: result.block.endId,
+            topic: result.block.topic,
+            coveredMessageIds: result.block.coveredMessageIds,
+            coveredToolCallIds: result.block.coveredToolCallIds
+          })),
+          responseUsage: response.usage
+        }
+      };
+    }
+  };
+}
+
 function resolveTimezone(): string | undefined {
   if (process.env.TZ) {
     return process.env.TZ;
@@ -394,4 +538,12 @@ function resolveTimezone(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function getInitialDynamicCompressionState(context?: false | ContextEngineOptions): DynamicCompressionState {
+  if (context === false || !context?.dynamicCompression) {
+    return createDynamicCompressionState();
+  }
+
+  return context.dynamicCompression.state ?? createDynamicCompressionState();
 }

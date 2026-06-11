@@ -1,12 +1,14 @@
 import type { AgentMessage, AssistantMessage, ContextCompactionMetadata, RequestTokenEstimateMetadata } from "../types.js";
 import type { LlmRequest } from "../llm/types.js";
 import { BudgetManager, resolveContextEngineOptions } from "./budget-manager.js";
+import { DynamicCompressor } from "./dynamic-compressor.js";
 import { CONTEXT_HANDOFF_SUMMARY_PROMPT, HistoryCompressor } from "./history-compressor.js";
 import { PromptBuilder } from "./prompt-builder.js";
 import { estimateRequestTokens, estimateTextTokens, type RequestTokenEstimate } from "./token-estimator.js";
 import type { ContextEngineOptions, ContextSummarySource, ResolvedContextEngineOptions } from "./types.js";
 
-export type SummaryModel = (request: LlmRequest) => Promise<AssistantMessage>;
+export type ContextSummaryPurpose = "handoff" | "dynamic";
+export type SummaryModel = (request: LlmRequest, purpose?: ContextSummaryPurpose) => Promise<AssistantMessage>;
 
 export type PreparedContextRequest = {
   request: LlmRequest;
@@ -17,12 +19,14 @@ export class ContextEngine {
   private readonly options: ResolvedContextEngineOptions;
   private readonly budget: BudgetManager;
   private readonly compressor: HistoryCompressor;
+  private readonly dynamicCompressor: DynamicCompressor;
   private readonly promptBuilder = new PromptBuilder();
 
   constructor(options: ContextEngineOptions = {}) {
     this.options = resolveContextEngineOptions(options);
     this.budget = new BudgetManager(this.options);
     this.compressor = new HistoryCompressor(this.options);
+    this.dynamicCompressor = new DynamicCompressor(this.options);
   }
 
   prepare(request: LlmRequest): LlmRequest {
@@ -52,12 +56,14 @@ export class ContextEngine {
     }
 
     const requestWithTruncatedTools = this.buildRequestView(request);
-    const estimate = estimateRequestTokens(requestWithTruncatedTools);
-    if (!this.budget.shouldCompact(estimate.totalTokens)) {
-      return { request: withContextMetadata(requestWithTruncatedTools, false, estimate) };
+    const baseEstimate = estimateRequestTokens(requestWithTruncatedTools);
+    const dynamicResult = this.dynamicCompressor.prepare(requestWithTruncatedTools, baseEstimate, summarize);
+
+    if (dynamicResult instanceof Promise) {
+      return dynamicResult.then((result) => this.finishPreparedRequest(result.request, result.applied, summarize, "automatic"));
     }
 
-    return this.compactRequestView(requestWithTruncatedTools, estimate, summarize, "automatic");
+    return this.finishPreparedRequest(dynamicResult.request, dynamicResult.applied, summarize, "automatic");
   }
 
   private async compactInternal(
@@ -80,6 +86,20 @@ export class ContextEngine {
       systemPrompt: this.promptBuilder.buildSystemPrompt(request.systemPrompt),
       messages: this.compressor.truncateToolResults(request.messages)
     };
+  }
+
+  private finishPreparedRequest(
+    requestView: LlmRequest,
+    dynamicallyCompressed: boolean,
+    summarize: SummaryModel | undefined,
+    mode: ContextCompactionMetadata["mode"]
+  ): PreparedContextRequest | Promise<PreparedContextRequest> {
+    const estimate = estimateRequestTokens(requestView, { useProviderUsage: !dynamicallyCompressed });
+    if (!this.budget.shouldCompact(estimate.totalTokens)) {
+      return { request: withContextMetadata(requestView, dynamicallyCompressed, estimate) };
+    }
+
+    return this.compactRequestView(requestView, estimate, summarize, mode);
   }
 
   private compactRequestView(
@@ -117,9 +137,9 @@ export class ContextEngine {
     mode: ContextCompactionMetadata["mode"]
   ): Promise<PreparedContextRequest> {
     const compactionPlan = this.compressor.planCompaction(request.messages);
-    const summaryRequest = buildSummaryRequest(request);
+    const summaryRequest = this.buildSummaryRequest(request);
     const summaryRequestEstimate = estimateRequestTokens(summaryRequest);
-    const summaryMessage = await summarize(summaryRequest);
+    const summaryMessage = await summarize(summaryRequest, "handoff");
     const compactedMessages = this.compressor.compactWithHandoffSummary(request.messages, summaryMessage.content, {
       plan: compactionPlan
     });
@@ -137,6 +157,7 @@ export class ContextEngine {
       compactedEstimate,
       summaryCall: {
         messageCount: summaryRequest.messages.length,
+        model: summaryRequest.model,
         request: toEstimateMetadata(summaryRequestEstimate),
         responseUsage: summaryMessage.usage,
         summaryTokens: estimateTextTokens(summaryMessage.content),
@@ -148,20 +169,22 @@ export class ContextEngine {
       historyReplacement: mode === "manual" ? compactedMessages : undefined
     };
   }
-}
 
-function buildSummaryRequest(request: LlmRequest): LlmRequest {
-  return {
-    ...request,
-    messages: [
-      ...request.messages,
-      {
-        role: "user",
-        content: CONTEXT_HANDOFF_SUMMARY_PROMPT
-      }
-    ],
-    tools: []
-  };
+  private buildSummaryRequest(request: LlmRequest): LlmRequest {
+    return {
+      ...request,
+      model: this.options.compressionModel ?? request.model,
+      reasoning: this.options.compressionReasoning ?? request.reasoning,
+      messages: [
+        ...request.messages,
+        {
+          role: "user",
+          content: CONTEXT_HANDOFF_SUMMARY_PROMPT
+        }
+      ],
+      tools: []
+    };
+  }
 }
 
 function withContextMetadata(

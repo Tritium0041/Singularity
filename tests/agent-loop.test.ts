@@ -444,6 +444,96 @@ test("agent automatically compacts with a full-history summary while preserving 
   assert.equal(agent.history.at(-1)?.content, "continued from summary");
 });
 
+test("agent lets the main model offload compaction to a side worker and projects the block on the next turn", async () => {
+  const mainLlm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "First answer with implementation detail."
+    },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "compress_1",
+          name: "compact_context",
+          arguments: {
+            goal: "free context before continuing",
+            maxBlocks: 1
+          }
+        }
+      ]
+    },
+    {
+      role: "assistant",
+      content: "continued with compressed context"
+    }
+  ]);
+  const compressionLlm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        blocks: [
+          {
+            startId: "m0001",
+            endId: "m0002",
+            topic: "first implementation detail",
+            summary: "Summary: preserve the implementation detail."
+          }
+        ]
+      }),
+      usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 }
+    }
+  ]);
+  const agent = new Agent({
+    llm: mainLlm,
+    model: "main-model",
+    compressionLlm,
+    compressionModel: "worker-model",
+    context: false
+  });
+
+  await agent.run("First detailed request", { context: false });
+  await agent.run("Second request after history grows", {
+    context: {
+      contextWindowTokens: 10000,
+      reservedOutputTokens: 0,
+      compactionThresholdRatio: 1,
+      keepRecentTokens: 1,
+      dynamicCompression: {
+        enabled: true,
+        triggerTokens: 1,
+        minCompressMessages: 2
+      }
+    }
+  });
+
+  const protocolRequest = mainLlm.requests[1];
+  assert.equal(protocolRequest?.tools?.some((tool) => tool.name === "compact_context"), true);
+  assert.match(protocolRequest?.systemPrompt ?? "", /dynamic_context_compression/);
+  assert.match(protocolRequest?.messages[0]?.content ?? "", /\[context m0001 role=user\]/);
+  assert.match(protocolRequest?.messages[1]?.content ?? "", /\[context m0002 role=assistant\]/);
+
+  assert.equal(compressionLlm.requests.length, 1);
+  assert.equal(compressionLlm.requests[0]?.model, "worker-model");
+  assert.equal(compressionLlm.requests[0]?.systemPrompt, protocolRequest?.systemPrompt);
+  assert.equal(compressionLlm.requests[0]?.tools?.length, 0);
+  assert.deepEqual(compressionLlm.requests[0]?.messages.slice(0, -1), protocolRequest?.messages);
+  assert.match(compressionLlm.requests[0]?.messages[0]?.content ?? "", /\[context m0001 role=user\]/);
+  assert.match(compressionLlm.requests[0]?.messages.at(-1)?.content ?? "", /side worker for dynamic context compression/);
+  assert.match(compressionLlm.requests[0]?.messages.at(-1)?.content ?? "", /free context before continuing/);
+
+  const compressedMainRequest = mainLlm.requests[2];
+  assert.equal(compressedMainRequest?.model, "main-model");
+  assert.equal(compressedMainRequest?.metadata?.context?.dynamicCompression?.applied, true);
+  assert.equal(compressedMainRequest?.messages.some((message) => message.content.includes("Dynamic context summary: b1")), true);
+  assert.equal(compressedMainRequest?.messages.some((message) => message.content.includes("Summary: preserve the implementation detail.")), true);
+  assert.equal(compressedMainRequest?.messages.some((message) => message.content.includes("First answer with implementation detail.")), false);
+  assert.equal(compressedMainRequest?.messages.some((message) => message.role === "tool" && message.toolName === "compact_context"), true);
+  assert.equal(agent.history.some((message) => message.role === "assistant" && message.content === "First answer with implementation detail."), true);
+  assert.equal(agent.history.some((message) => message.role === "tool" && message.toolName === "compact_context"), true);
+});
+
 test("automatic compaction preserves the live tool-call turn and tool guidance", async () => {
   const longOutput = "tool-result-".repeat(260);
   const longTool: AgentTool = {

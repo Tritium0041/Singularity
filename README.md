@@ -11,7 +11,7 @@ Singularity is a minimal TypeScript agent runtime for experimenting with LLM too
 - OpenAI Responses, OpenAI-compatible Chat Completions, and Anthropic Messages support.
 - Built-in basic, file, shell, and web/search tools.
 - Tool output truncation for large file, command, and URL results.
-- Context budgeting uses provider-reported token usage when available, then compacts long histories with a one-shot no-tool handoff summary.
+- Context budgeting uses provider-reported token usage when available, can dynamically summarize stale history in the request view, and still falls back to one-shot no-tool handoff compaction for oversized histories.
 
 ## Requirements
 
@@ -55,10 +55,32 @@ LLM_API_KEY=your_key_here npm run demo -- --once "What is (123 + 456) * 789?"
 Interactive commands:
 
 - `/usage`: show current session token usage and latest context estimate.
+- `/config`: show or change demo settings without restarting with new environment variables.
 - `/compact`: manually summarize and compact the current conversation history.
 - `/new`: reset conversation history and usage counters.
 - `/clear`: clear the terminal view.
 - `/exit`: quit the demo.
+
+The TUI config command stores overrides in local `.agent-demo.json`, which is ignored by git:
+
+```txt
+/config show
+/config keys
+/config set provider openai-chat
+/config set model qwen3
+/config set baseURL http://localhost:11434/v1
+/config set apiKey ollama
+/config set toolset all
+/config set maxTurns 12
+/config set tavilyApiKey tvly-dev-...
+/config set dynamicCompression true
+/config set dynamicAutoSummarize false
+/config set compressionModel gpt-4.1-mini
+/config unset compressionModel
+/config reset
+```
+
+Changing config rebuilds the demo agent and resets the active conversation. Use `/config` before a long run when you want the changed model, toolset, context budget, or compression settings to apply from the start.
 
 Optional environment variables:
 
@@ -70,9 +92,16 @@ Optional environment variables:
 - `OPENAI_COMPAT_MODEL` / `OPENAI_COMPAT_BASE_URL` / `OPENAI_COMPAT_API_KEY`: fallback values for `openai-chat`.
 - `ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`: fallback values for `anthropic`.
 - `AGENT_REASONING_EFFORT`: reasoning effort passed to supported models.
+- `AGENT_COMPRESSION_PROVIDER`: optional provider for context compression calls. Defaults to the main provider.
+- `AGENT_COMPRESSION_MODEL`: optional model for context compression calls. Defaults to the main model.
+- `AGENT_DYNAMIC_COMPRESSION`: set to `1`, `true`, `on`, or `yes` to enable dynamic request-view compression.
+- `AGENT_DYNAMIC_AUTO_SUMMARIZE`: optionally enable the older automatic prefix summary fallback. The default dynamic path is offloaded through `compact_context`.
+- `AGENT_DYNAMIC_TRIGGER_TOKENS`: optional token estimate threshold for dynamic compression.
+- `AGENT_DYNAMIC_KEEP_RECENT_TOKENS`: optional recent-context budget preserved outside the dynamic summary.
+- `AGENT_DYNAMIC_MIN_MESSAGES`: optional minimum selected stale messages before dynamic compression runs.
 - `AGENT_TOOLSET`: `basic`, `files`, `shell`, `web`, or `all`. Defaults to `basic`.
 - `AGENT_MAX_TURNS`: positive integer overriding the demo run's max turn count. The agent default is `8`.
-- `TAVILY_API_KEY`: required by the `web_search` tool.
+- `TAVILY_API_KEY`: required by the `web_search` tool unless `tavilyApiKey` is set through `/config`.
 
 OpenAI-compatible local or third-party providers can use the Chat Completions adapter:
 
@@ -116,6 +145,51 @@ console.log(result.output);
 ```
 
 Agents automatically build a system prompt from Singularity's default coding-agent instructions, the configured `systemPrompt`, and a compact conversation background (`cwd`, date, timezone, shell, and enabled tool names). Override values through `background`, or set `background: false` for the exact system prompt string only.
+
+Dynamic compression is opt-in and does not mutate `agent.history`. When enabled, the request view includes stable message IDs such as `m0001`, a `compact_context` tool, and a compression nudge once the configured token threshold is crossed. The main model only has to call `compact_context`; that tool starts a side compression worker using `compressionLlm`/`compressionModel` when configured, or the main LLM otherwise. The worker inspects the visible context, chooses stale closed ranges, returns JSON summaries, and future requests replace those raw ranges with reusable `bN` summary blocks. The existing threshold-based handoff compaction remains a fallback for oversized histories.
+
+By default the compressed range is replaced by the summary block. Set `preserveUserMessages: true` only when you explicitly want old user messages copied alongside the summary.
+
+Content wrapped in `<protect>...</protect>` inside a compressed range is copied into the final block summary by local code, even if the model omits it from the submitted summary.
+
+```ts
+const agent = new Agent({
+  llm: llm.llm,
+  model: llm.model,
+  tools: createCoreTools({ toolset: "basic" }),
+  context: {
+    dynamicCompression: {
+      enabled: true,
+      triggerTokens: 50000,
+      keepRecentTokens: 20000
+    }
+  }
+});
+```
+
+If you want the older automatic prefix summarizer behavior, set `autoSummarize: true`; those calls can use the main LLM or a separate client/model:
+
+```ts
+const compression = createLlmClientFromEnv({
+  provider: "openai-chat",
+  model: "gpt-4.1-mini"
+});
+
+const agent = new Agent({
+  llm: llm.llm,
+  model: llm.model,
+  compressionLlm: compression.llm,
+  compressionModel: compression.model,
+  tools: createCoreTools({ toolset: "basic" }),
+  context: {
+    dynamicCompression: {
+      enabled: true,
+      autoSummarize: true,
+      triggerTokens: 50000
+    }
+  }
+});
+```
 
 ## Project Structure
 

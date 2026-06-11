@@ -1,4 +1,4 @@
-import type { ContextEngineOptions, ContextSummarySource } from "./context/types.js";
+import type { ContextEngineOptions, ContextSummarySource, DynamicCompressionMetadata } from "./context/types.js";
 
 export type JsonSchema = {
   type?: string;
@@ -86,6 +86,7 @@ export type ContextCompactionMetadata = {
   compacted: RequestTokenEstimateMetadata;
   summaryCall?: {
     messageCount: number;
+    model?: string;
     request: RequestTokenEstimateMetadata;
     responseUsage?: TokenUsage;
     summaryTokens: number;
@@ -102,6 +103,7 @@ export type RequestContextMetadata = {
   compactionSummarySource?: "heuristic" | "model";
   estimate?: RequestTokenEstimateMetadata;
   compaction?: ContextCompactionMetadata;
+  dynamicCompression?: DynamicCompressionMetadata;
 };
 
 export type AssistantContextMetadata = {
