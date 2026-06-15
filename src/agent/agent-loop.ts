@@ -25,6 +25,14 @@ import {
   ContextEngine
 } from "../context/index.js";
 import { isStreamingLlmClient, type LlmClient, type LlmRequest } from "../llm/types.js";
+import {
+  buildMemoryInstructions,
+  createMemoryStoreTools,
+  createWorkspaceTools,
+  MarkdownMemoryStore,
+  WorkspaceMemory,
+  type WorkspaceState
+} from "../memory/index.js";
 import { ToolExecutor, ToolRegistry, type AgentTool, type ToolExecutionMode } from "../tools/registry.js";
 
 type PreparedAgentRequest = {
@@ -48,7 +56,23 @@ export type AgentConfig = {
   context?: false | ContextEngineOptions;
   background?: false | SystemPromptBackgroundOptions;
   promptFragments?: readonly PromptFragment[];
+  history?: readonly AgentMessage[];
+  memory?:
+    | false
+    | {
+        workspace?: WorkspaceMemory | WorkspaceState;
+        store?: MarkdownMemoryStore | { path?: string };
+        includeInstructions?: boolean;
+        maxMemoryResults?: number;
+      };
   onEvent?: AgentEventSink;
+};
+
+type ResolvedAgentMemory = {
+  workspace: WorkspaceMemory;
+  store?: MarkdownMemoryStore;
+  includeInstructions: boolean;
+  maxMemoryResults: number;
 };
 
 export class Agent {
@@ -66,6 +90,7 @@ export class Agent {
   private readonly tools: ToolRegistry;
   private readonly messages: AgentMessage[] = [];
   private readonly dynamicCompressionState: DynamicCompressionState;
+  private readonly memory: ResolvedAgentMemory | undefined;
 
   constructor(config: AgentConfig) {
     this.llm = config.llm;
@@ -80,6 +105,8 @@ export class Agent {
     this.context = config.context;
     this.tools = config.tools instanceof ToolRegistry ? config.tools : new ToolRegistry(config.tools ?? []);
     this.dynamicCompressionState = getInitialDynamicCompressionState(config.context);
+    this.memory = this.resolveMemoryConfig(config.memory);
+    this.messages.push(...(config.history ?? []).map(cloneAgentMessage));
     this.systemPrompt = this.buildSystemPrompt(config);
   }
 
@@ -318,6 +345,12 @@ export class Agent {
         })
       );
     }
+    if (this.memory) {
+      tools.push(...createWorkspaceTools(this.memory.workspace));
+      if (this.memory.store) {
+        tools.push(...createMemoryStoreTools(this.memory.store, { maxMemoryResults: this.memory.maxMemoryResults }));
+      }
+    }
     return new ToolRegistry(tools);
   }
 
@@ -327,8 +360,38 @@ export class Agent {
       basePrompt: config.systemPrompt,
       defaultInstructions: config.background === false ? false : undefined,
       background,
-      fragments: config.promptFragments
+      fragments: this.buildStaticPromptFragments(config)
     });
+  }
+
+  private buildStaticPromptFragments(config: AgentConfig): PromptFragment[] {
+    const fragments = [...(config.promptFragments ?? [])];
+    if (config.background === false || !this.memory?.includeInstructions) {
+      return fragments;
+    }
+
+    const memoryInstructions = buildMemoryInstructions({
+      hasWorkspace: true,
+      hasStore: Boolean(this.memory.store)
+    });
+    if (memoryInstructions) {
+      fragments.push(memoryInstructions);
+    }
+    return fragments;
+  }
+
+  private resolveMemoryConfig(config: AgentConfig["memory"]): ResolvedAgentMemory | undefined {
+    if (config === false) {
+      return undefined;
+    }
+
+    const memoryConfig = config ?? {};
+    return {
+      workspace: resolveWorkspace(memoryConfig.workspace),
+      store: resolveMemoryStore(memoryConfig.store),
+      includeInstructions: memoryConfig.includeInstructions ?? true,
+      maxMemoryResults: clampMemoryResults(memoryConfig.maxMemoryResults ?? 5)
+    };
   }
 
   private buildBackgroundOptions(background: AgentConfig["background"]): false | SystemPromptBackgroundOptions {
@@ -546,4 +609,32 @@ function getInitialDynamicCompressionState(context?: false | ContextEngineOption
   }
 
   return context.dynamicCompression.state ?? createDynamicCompressionState();
+}
+
+function resolveWorkspace(workspace: WorkspaceMemory | WorkspaceState | undefined): WorkspaceMemory {
+  if (workspace instanceof WorkspaceMemory) {
+    return workspace;
+  }
+  return new WorkspaceMemory(workspace);
+}
+
+function resolveMemoryStore(store: MarkdownMemoryStore | { path?: string } | undefined): MarkdownMemoryStore | undefined {
+  if (!store) {
+    return undefined;
+  }
+  if (store instanceof MarkdownMemoryStore) {
+    return store;
+  }
+  return new MarkdownMemoryStore(store);
+}
+
+function clampMemoryResults(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 5;
+  }
+  return Math.min(20, Math.max(1, Math.floor(value)));
+}
+
+function cloneAgentMessage(message: AgentMessage): AgentMessage {
+  return JSON.parse(JSON.stringify(message)) as AgentMessage;
 }

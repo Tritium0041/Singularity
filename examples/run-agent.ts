@@ -3,10 +3,15 @@ import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import {
   Agent,
+  AgentSessionStore,
   createCoreTools,
   createLlmClientFromEnv,
+  MarkdownMemoryStore,
+  WorkspaceMemory,
   type ContextEngineOptions,
   type AgentEvent,
+  type AgentSessionRecord,
+  type AgentSessionUsageSnapshot,
   type ContextCompactionMetadata,
   type CoreToolset,
   type EnvLlmClient,
@@ -18,6 +23,7 @@ import {
 
 const DEFAULT_PROMPT = "Calculate (123 + 456) * 789, then tell me the result.";
 const CONFIG_PATH = ".agent-demo.json";
+const SESSION_DIR = ".agent-sessions";
 
 type CliOptions = {
   help: boolean;
@@ -32,13 +38,7 @@ type StreamDisplayState = {
   turnStreamedText: boolean;
 };
 
-type SessionUsageSnapshot = {
-  assistantTurns: number;
-  compactions: number;
-  usageUnavailableCalls: number;
-  latestContext?: RequestContextMetadata;
-  providerUsage?: TokenUsage;
-};
+type SessionUsageSnapshot = AgentSessionUsageSnapshot;
 
 type DemoConfig = {
   provider?: string;
@@ -64,6 +64,9 @@ type DemoConfig = {
   maxToolResultTokens?: number;
   compactionThresholdRatio?: number;
   summarizeHistory?: boolean;
+  memory?: boolean;
+  memoryPath?: string;
+  maxMemoryResults?: number;
 };
 
 type DemoConfigKey = keyof DemoConfig;
@@ -91,16 +94,28 @@ const CONFIG_KEY_HELP: Record<DemoConfigKey, string> = {
   keepRecentTokens: "positive integer fallback compaction recent budget",
   maxToolResultTokens: "positive integer tool-result truncation budget",
   compactionThresholdRatio: "number between 0 and 1",
-  summarizeHistory: "true/false use model handoff summaries"
+  summarizeHistory: "true/false use model handoff summaries",
+  memory: "true/false enable long-term Markdown memory store",
+  memoryPath: "path for long-term Markdown memory store",
+  maxMemoryResults: "positive integer default search_memory result count"
 };
 
 class SessionUsageLedger {
   private providerUsage: TokenUsage = {};
-  private providerUsageTurns = 0;
-  private usageUnavailableCalls = 0;
-  private assistantTurns = 0;
-  private compactions = 0;
+  private providerUsageTurns: number;
+  private usageUnavailableCalls: number;
+  private assistantTurns: number;
+  private compactions: number;
   private latestContext: RequestContextMetadata | undefined;
+
+  constructor(initial: SessionUsageSnapshot = { assistantTurns: 0, compactions: 0, usageUnavailableCalls: 0 }) {
+    this.providerUsage = initial.providerUsage ?? {};
+    this.providerUsageTurns = initial.providerUsage ? 1 : 0;
+    this.usageUnavailableCalls = initial.usageUnavailableCalls;
+    this.assistantTurns = initial.assistantTurns;
+    this.compactions = initial.compactions;
+    this.latestContext = initial.latestContext;
+  }
 
   recordTurn(event: Extract<AgentEvent, { type: "turn_end" }>): SessionUsageSnapshot {
     this.assistantTurns += 1;
@@ -185,6 +200,10 @@ let maxTurns = resolveMaxTurns();
 let displayState = createDisplayState();
 let usageLedger = new SessionUsageLedger();
 let exchangeCount = 0;
+let workspaceMemory = new WorkspaceMemory();
+let activeSession: AgentSessionRecord | undefined;
+let sessions = new AgentSessionStore({ dir: SESSION_DIR });
+let sessionPersistenceEnabled = false;
 let agent = createDemoAgent();
 
 if (cli.once || !stdin.isTTY) {
@@ -194,6 +213,8 @@ if (cli.once || !stdin.isTTY) {
     process.exitCode = 1;
   }
 } else {
+  sessionPersistenceEnabled = true;
+  await restoreActiveSession();
   renderBanner("tui");
   if (cli.prompt) {
     await runUserPrompt(cli.prompt);
@@ -214,6 +235,12 @@ function createDemoAgent(): Agent {
       toolset,
       web: { apiKey: demoConfig.tavilyApiKey }
     }),
+    memory: {
+      workspace: workspaceMemory,
+      store: createDemoMemoryStore(),
+      maxMemoryResults: demoConfig.maxMemoryResults
+    },
+    history: activeSession?.messages,
     context: buildContextOptions(),
     onEvent(event) {
       if (event.type === "turn_start") {
@@ -288,6 +315,9 @@ async function runTui(): Promise<void> {
 }
 
 async function runUserPrompt(input: string): Promise<boolean> {
+  if (sessionPersistenceEnabled) {
+    await ensureActiveSession();
+  }
   exchangeCount += 1;
   displayState = createDisplayState();
   console.log(`\n[user ${exchangeCount}] ${input}`);
@@ -302,6 +332,7 @@ async function runUserPrompt(input: string): Promise<boolean> {
     if (result.stoppedBy === "max_turns") {
       console.log(`[stop] reached maxTurns=${result.turns}`);
     }
+    await saveActiveSession();
     return true;
   } catch (error) {
     finishStreamingLine();
@@ -322,8 +353,30 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
     console.log(formatSessionStatus());
     return "handled";
   }
+  if (input === "/sessions") {
+    await printSessions();
+    return "handled";
+  }
+  if (input === "/session" || input.startsWith("/session ")) {
+    await handleSessionCommand(input);
+    return "handled";
+  }
   if (input === "/config" || input.startsWith("/config ")) {
     await handleConfigCommand(input);
+    return "handled";
+  }
+  if (input === "/memory" || input.startsWith("/memory ")) {
+    await handleMemoryCommand(input);
+    return "handled";
+  }
+  if (input === "/notes") {
+    printWorkspaceNotes();
+    return "handled";
+  }
+  if (input === "/forget-notes") {
+    workspaceMemory.clear();
+    await saveActiveSession();
+    console.log("[notes] workspace cleared");
     return "handled";
   }
   if (input === "/compact") {
@@ -336,10 +389,8 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
     return "handled";
   }
   if (input === "/new") {
-    usageLedger = new SessionUsageLedger();
-    exchangeCount = 0;
-    agent = createDemoAgent();
-    console.log("[new] conversation and usage counters reset");
+    await createAndSwitchSession("Untitled session");
+    console.log(`[new] created session ${activeSession?.id}`);
     return "handled";
   }
   if (input.startsWith("/")) {
@@ -347,6 +398,148 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
     return "handled";
   }
   return "message";
+}
+
+async function restoreActiveSession(): Promise<void> {
+  const result = await sessions.loadActiveSession();
+  for (const warning of result.warnings) {
+    console.warn(`[session:warn] ${warning}`);
+  }
+  if (!result.session) {
+    if (result.warnings.length > 0) {
+      await createAndSwitchSession("Untitled session");
+      console.log(`[session] started fresh session ${activeSession?.id}`);
+    }
+    return;
+  }
+
+  switchToSession(result.session);
+  console.log(`[session] restored ${result.session.id} "${result.session.title}" messages=${result.session.messages.length}`);
+}
+
+async function ensureActiveSession(title?: string): Promise<AgentSessionRecord> {
+  if (activeSession) {
+    return activeSession;
+  }
+  return createAndSwitchSession(title);
+}
+
+async function createAndSwitchSession(title?: string): Promise<AgentSessionRecord> {
+  const session = await sessions.createSession({ title });
+  switchToSession(session);
+  return session;
+}
+
+function switchToSession(session: AgentSessionRecord): void {
+  activeSession = session;
+  exchangeCount = session.exchangeCount;
+  usageLedger = new SessionUsageLedger(session.usage);
+  workspaceMemory = new WorkspaceMemory(session.workspace);
+  agent = createDemoAgent();
+}
+
+async function saveActiveSession(): Promise<void> {
+  if (!sessionPersistenceEnabled || !activeSession) {
+    return;
+  }
+
+  activeSession = await sessions.saveSession({
+    ...activeSession,
+    exchangeCount,
+    messages: [...agent.history],
+    workspace: workspaceMemory.state,
+    usage: usageLedger.snapshot()
+  });
+}
+
+async function resetConversationToNewSession(reason: string): Promise<void> {
+  await createAndSwitchSession("Untitled session");
+  console.log(`${reason}; switched to fresh session ${activeSession?.id}`);
+}
+
+async function handleSessionCommand(input: string): Promise<void> {
+  const [, subcommand = "show", ...args] = input.split(/\s+/);
+  const normalized = subcommand.toLowerCase();
+
+  try {
+    if (normalized === "show" || normalized === "status") {
+      await printActiveSession();
+      return;
+    }
+    if (normalized === "new") {
+      const title = args.join(" ").trim() || undefined;
+      await createAndSwitchSession(title);
+      console.log(`[session] created ${activeSession?.id} "${activeSession?.title}"`);
+      return;
+    }
+    if (normalized === "use" || normalized === "switch") {
+      const id = args[0];
+      if (!id) {
+        console.log("[session] usage: /session use <id>");
+        return;
+      }
+      const session = await sessions.loadSession(id);
+      switchToSession(await sessions.saveSession(session));
+      console.log(`[session] active ${activeSession?.id} "${activeSession?.title}"`);
+      return;
+    }
+    if (normalized === "rename") {
+      const title = args.join(" ").trim();
+      if (!title) {
+        console.log("[session] usage: /session rename <title>");
+        return;
+      }
+      await ensureActiveSession();
+      switchToSession(await sessions.renameSession(activeSession!.id, title));
+      console.log(`[session] renamed ${activeSession?.id} "${activeSession?.title}"`);
+      return;
+    }
+    if (normalized === "delete" || normalized === "rm") {
+      const id = args[0];
+      if (!id) {
+        console.log("[session] usage: /session delete <id>");
+        return;
+      }
+      const deletingActive = activeSession?.id === id;
+      await sessions.deleteSession(id);
+      if (deletingActive) {
+        await createAndSwitchSession("Untitled session");
+        console.log(`[session] deleted ${id}; created ${activeSession?.id}`);
+      } else {
+        console.log(`[session] deleted ${id}`);
+      }
+      return;
+    }
+
+    console.log("[session] usage: /session show, /session new [title], /session use <id>, /session rename <title>, /session delete <id>");
+  } catch (error) {
+    console.error(`[session:error] ${formatError(error)}`);
+  }
+}
+
+async function printSessions(): Promise<void> {
+  const allSessions = await sessions.listSessions();
+  if (allSessions.length === 0) {
+    console.log("[sessions] none");
+    return;
+  }
+
+  for (const session of allSessions) {
+    const marker = session.id === activeSession?.id ? "*" : " ";
+    console.log(
+      `[sessions] ${marker} ${session.id} "${session.title}" updated=${session.updatedAt} exchanges=${session.exchangeCount} messages=${session.messageCount} notes=${session.workspaceNoteCount}`
+    );
+  }
+}
+
+async function printActiveSession(): Promise<void> {
+  await ensureActiveSession();
+  const session = activeSession!;
+  console.log(`[session] id=${session.id}`);
+  console.log(`[session] title=${session.title}`);
+  console.log(`[session] file=${sessions.sessionPath(session.id)}`);
+  console.log(`[session] created=${session.createdAt} updated=${session.updatedAt}`);
+  console.log(`[session] exchanges=${exchangeCount} messages=${agent.history.length} workspace_notes=${workspaceMemory.state.notes.length}`);
 }
 
 async function handleConfigCommand(input: string): Promise<void> {
@@ -389,8 +582,8 @@ async function runConfigCommand(input: string): Promise<void> {
     };
     saveDemoConfig(demoConfig);
     reloadRuntimeFromConfig();
+    await resetConversationToNewSession("[config] saved and applied; conversation reset");
     console.log(`[config] set ${key}=${formatConfigValue(key, demoConfig[key])}`);
-    console.log("[config] saved and applied; conversation reset");
     return;
   }
 
@@ -405,8 +598,8 @@ async function runConfigCommand(input: string): Promise<void> {
     demoConfig = next;
     saveDemoConfig(demoConfig);
     reloadRuntimeFromConfig();
+    await resetConversationToNewSession("[config] saved and applied; conversation reset");
     console.log(`[config] unset ${key}`);
-    console.log("[config] saved and applied; conversation reset");
     return;
   }
 
@@ -419,7 +612,7 @@ async function runConfigCommand(input: string): Promise<void> {
   if (normalized === "reload") {
     demoConfig = loadDemoConfig();
     reloadRuntimeFromConfig();
-    console.log(`[config] reloaded ${CONFIG_PATH}; conversation reset`);
+    await resetConversationToNewSession(`[config] reloaded ${CONFIG_PATH}; conversation reset`);
     return;
   }
 
@@ -427,7 +620,7 @@ async function runConfigCommand(input: string): Promise<void> {
     demoConfig = {};
     saveDemoConfig(demoConfig);
     reloadRuntimeFromConfig();
-    console.log(`[config] reset ${CONFIG_PATH}; conversation reset`);
+    await resetConversationToNewSession(`[config] reset ${CONFIG_PATH}; conversation reset`);
     return;
   }
 
@@ -441,7 +634,40 @@ function reloadRuntimeFromConfig(): void {
   maxTurns = resolveMaxTurns();
   usageLedger = new SessionUsageLedger();
   exchangeCount = 0;
+  workspaceMemory = new WorkspaceMemory();
+  activeSession = undefined;
   agent = createDemoAgent();
+}
+
+async function handleMemoryCommand(input: string): Promise<void> {
+  const [, subcommand = "show"] = input.split(/\s+/);
+  const normalized = subcommand.toLowerCase();
+
+  if (normalized === "show" || normalized === "status") {
+    printMemoryStatus();
+    return;
+  }
+
+  if (normalized === "on") {
+    demoConfig = { ...demoConfig, memory: true };
+    saveDemoConfig(demoConfig);
+    reloadRuntimeFromConfig();
+    await resetConversationToNewSession("[memory] enabled; conversation reset");
+    const store = createRequiredDemoMemoryStore();
+    await store.ensureFile();
+    console.log(`[memory] store=${store.path}`);
+    return;
+  }
+
+  if (normalized === "off") {
+    demoConfig = { ...demoConfig, memory: false };
+    saveDemoConfig(demoConfig);
+    reloadRuntimeFromConfig();
+    await resetConversationToNewSession("[memory] long-term store disabled; conversation reset");
+    return;
+  }
+
+  console.log("[memory] usage: /memory, /memory on, /memory off");
 }
 
 async function runManualCompaction(): Promise<void> {
@@ -461,6 +687,7 @@ async function runManualCompaction(): Promise<void> {
     }
     printCompactionDetails(result.context.compaction);
     console.log(`[compact] complete; messages=${result.messages.length}; ${formatProviderUsage("session", snapshot.providerUsage)}`);
+    await saveActiveSession();
   } catch (error) {
     console.error(`[compact:error] ${formatError(error)}`);
   }
@@ -474,7 +701,11 @@ function renderBanner(mode: "tui" | "one-shot"): void {
   }
   console.log(`toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
   if (mode === "tui") {
-    console.log("commands=/help /usage /config /compact /new /clear /exit");
+    console.log(`session=${activeSession ? `${activeSession.id} "${activeSession.title}"` : "(new on first message)"}`);
+  }
+  console.log(`workspace_notes=${workspaceMemory.state.notes.length} memory_store=${demoConfig.memory ? createRequiredDemoMemoryStore().path : "off"}`);
+  if (mode === "tui") {
+    console.log("commands=/help /usage /sessions /session /config /memory /notes /compact /new /clear /exit");
   }
 }
 
@@ -493,15 +724,20 @@ Environment:
   AGENT_DYNAMIC_COMPRESSION=1
 
 Interactive commands:
-  /usage, /config, /compact, /new, /clear, /exit`);
+  /usage, /sessions, /session, /config, /memory, /notes, /compact, /new, /clear, /exit`);
 }
 
 function printTuiHelp(): void {
   console.log(`Commands:
   /usage  show current provider token totals and latest context estimate
+  /sessions list saved sessions
+  /session show current session; subcommands: new/use/rename/delete
   /config show current config and change runtime settings
+  /memory show, enable, or disable the long-term Markdown memory store
+  /notes  show current workspace notes
+  /forget-notes clear current workspace notes
   /compact manually summarize and compact the current conversation history
-  /new    reset conversation history and usage counters
+  /new    create and switch to a fresh saved session
   /clear  clear the terminal view
   /exit   quit the demo`);
 }
@@ -525,6 +761,8 @@ Examples:
   /config set maxTurns 12
   /config set tavilyApiKey tvly-dev-...
   /config set dynamicCompression true
+  /config set memoryPath .agent-memory/MEMORY.md
+  /config set maxMemoryResults 8
   /config set compressionModel gpt-4.1-mini`);
 }
 
@@ -545,6 +783,7 @@ function printConfig(): void {
   console.log(`[config] toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
   const context = buildContextOptions();
   console.log(`[config] dynamicCompression=${context?.dynamicCompression ? "true" : "false"}`);
+  printMemoryStatus();
 
   const saved = cleanConfig(demoConfig);
   const savedKeys = Object.keys(saved) as DemoConfigKey[];
@@ -591,10 +830,13 @@ function formatTurnTokenUsage(
 function formatSessionStatus(): string {
   const snapshot = usageLedger.snapshot();
   const parts = [
-    `[status] exchanges=${exchangeCount}`,
+    `[status] session=${activeSession?.id ?? "new"} "${activeSession?.title ?? "unsaved"}"`,
+    `exchanges=${exchangeCount}`,
     `assistant_turns=${snapshot.assistantTurns}`,
     `compactions=${snapshot.compactions}`,
     `messages=${agent.history.length}`,
+    `workspace_notes=${workspaceMemory.state.notes.length}`,
+    `memory_store=${demoConfig.memory ? "on" : "off"}`,
     formatProviderUsage("provider_total", snapshot.providerUsage),
     `latest_${formatRequestContext(snapshot.latestContext)}`
   ];
@@ -697,6 +939,36 @@ function createCompressionLlmClient(main: EnvLlmClient): EnvLlmClient | undefine
     apiKey,
     baseURL
   });
+}
+
+function createDemoMemoryStore(): MarkdownMemoryStore | undefined {
+  return demoConfig.memory ? createRequiredDemoMemoryStore() : undefined;
+}
+
+function createRequiredDemoMemoryStore(): MarkdownMemoryStore {
+  return new MarkdownMemoryStore({ path: resolveMemoryPath() });
+}
+
+function resolveMemoryPath(): string {
+  return demoConfig.memoryPath ?? ".agent-memory/MEMORY.md";
+}
+
+function printMemoryStatus(): void {
+  const store = createDemoMemoryStore();
+  console.log(`[memory] workspace_notes=${workspaceMemory.state.notes.length}`);
+  console.log(`[memory] long_term=${store ? "on" : "off"} store=${store?.path ?? "(disabled)"} maxResults=${demoConfig.maxMemoryResults ?? 5}`);
+}
+
+function printWorkspaceNotes(): void {
+  const notes = workspaceMemory.state.notes;
+  if (notes.length === 0) {
+    console.log("[notes] none");
+    return;
+  }
+  for (const note of notes) {
+    console.log(`[notes] ${note.id} kind=${note.kind} updated=${note.updatedAt}`);
+    console.log(note.content);
+  }
 }
 
 function resolvesToProvider(value: string | undefined, provider: EnvLlmClient["provider"]): boolean {
@@ -846,11 +1118,22 @@ function parseConfigValue(key: DemoConfigKey, value: unknown): never {
 }
 
 function isStringKey(key: DemoConfigKey): boolean {
-  return key === "provider" || key === "model" || key === "apiKey" || key === "baseURL" || key === "compressionProvider" || key === "compressionModel" || key === "compressionApiKey" || key === "compressionBaseURL" || key === "tavilyApiKey";
+  return (
+    key === "provider" ||
+    key === "model" ||
+    key === "apiKey" ||
+    key === "baseURL" ||
+    key === "compressionProvider" ||
+    key === "compressionModel" ||
+    key === "compressionApiKey" ||
+    key === "compressionBaseURL" ||
+    key === "tavilyApiKey" ||
+    key === "memoryPath"
+  );
 }
 
 function isBooleanKey(key: DemoConfigKey): boolean {
-  return key === "dynamicCompression" || key === "dynamicAutoSummarize" || key === "summarizeHistory";
+  return key === "dynamicCompression" || key === "dynamicAutoSummarize" || key === "summarizeHistory" || key === "memory";
 }
 
 function parseBooleanConfig(value: unknown, key: string): boolean {

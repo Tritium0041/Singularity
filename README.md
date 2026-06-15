@@ -12,6 +12,7 @@ Singularity is a minimal TypeScript agent runtime for experimenting with LLM too
 - Built-in basic, file, shell, and web/search tools.
 - Tool output truncation for large file, command, and URL results.
 - Context budgeting uses provider-reported token usage when available, can dynamically summarize stale history in the request view, and still falls back to one-shot no-tool handoff compaction for oversized histories.
+- Memory System v1 with current-task Workspace notes, an optional append-only Markdown memory store, and tool-only memory retrieval.
 
 ## Requirements
 
@@ -38,7 +39,7 @@ npm run build
 LLM_API_KEY=your_key_here npm run demo
 ```
 
-The demo opens a small terminal chat UI. Each message keeps the same agent history, and the status line shows current provider token totals plus the latest context estimate. When context compaction runs, the demo prints the pre-compaction decision estimate, summary-call usage, and post-compaction context estimate.
+The demo opens a small terminal chat UI. Each TUI conversation is saved as a session under `.agent-sessions/`, and the next TUI launch resumes the active session from the last completed user exchange. The status line shows the active session, current provider token totals, and the latest context estimate. When context compaction runs, the demo prints the pre-compaction decision estimate, summary-call usage, and post-compaction context estimate.
 
 You can pass an initial prompt and continue chatting:
 
@@ -55,11 +56,29 @@ LLM_API_KEY=your_key_here npm run demo -- --once "What is (123 + 456) * 789?"
 Interactive commands:
 
 - `/usage`: show current session token usage and latest context estimate.
+- `/sessions`: list saved sessions.
+- `/session`: show or manage saved sessions.
 - `/config`: show or change demo settings without restarting with new environment variables.
+- `/memory`: show, enable, or disable the long-term Markdown memory store.
+- `/notes`: show current Workspace notes.
+- `/forget-notes`: clear current Workspace notes.
 - `/compact`: manually summarize and compact the current conversation history.
-- `/new`: reset conversation history and usage counters.
+- `/new`: create and switch to a fresh saved session.
 - `/clear`: clear the terminal view.
 - `/exit`: quit the demo.
+
+Session commands:
+
+```txt
+/sessions
+/session show
+/session new Optional title
+/session use <id>
+/session rename Better title
+/session delete <id>
+```
+
+Session files keep short-term conversation history, Workspace notes, exchange counters, and usage telemetry. They do not include the long-term Markdown memory store, which remains separate in `.agent-memory/`.
 
 The TUI config command stores overrides in local `.agent-demo.json`, which is ignored by git:
 
@@ -76,11 +95,25 @@ The TUI config command stores overrides in local `.agent-demo.json`, which is ig
 /config set dynamicCompression true
 /config set dynamicAutoSummarize false
 /config set compressionModel gpt-4.1-mini
+/config set memoryPath .agent-memory/MEMORY.md
+/config set maxMemoryResults 8
 /config unset compressionModel
 /config reset
 ```
 
 Changing config rebuilds the demo agent and resets the active conversation. Use `/config` before a long run when you want the changed model, toolset, context budget, or compression settings to apply from the start.
+
+Memory commands:
+
+```txt
+/memory
+/memory on
+/memory off
+/notes
+/forget-notes
+```
+
+Workspace memory is enabled in the demo so the agent can call `write_note`, `read_note`, and `update_workspace` during a task. Long-term memory is off until `/memory on` or `/config set memory true` enables the Markdown store. The default store path is `.agent-memory/MEMORY.md`, which is ignored by git.
 
 Optional environment variables:
 
@@ -152,6 +185,22 @@ By default the compressed range is replaced by the summary block. Set `preserveU
 
 Content wrapped in `<protect>...</protect>` inside a compressed range is copied into the final block summary by local code, even if the model omits it from the submitted summary.
 
+Memory System is tool-first. By default an agent gets current-task Workspace tools and static instructions about when to use them. Configure a Markdown store to add `store_memory` and `search_memory` for durable preferences, project conventions, and reusable lessons:
+
+```ts
+const agent = new Agent({
+  llm: llm.llm,
+  model: llm.model,
+  tools: createCoreTools({ toolset: "basic" }),
+  memory: {
+    store: { path: ".agent-memory/MEMORY.md" },
+    maxMemoryResults: 5
+  }
+});
+```
+
+Workspace notes and long-term memory entries are never injected into the system prompt. The system prompt only contains static rules telling the model when to use memory tools. Actual memory content enters `agent.history` only as normal tool results from `read_note`, `store_memory`, or `search_memory`, so Context Engine truncation and compaction keep handling the short-term request view.
+
 ```ts
 const agent = new Agent({
   llm: llm.llm,
@@ -195,6 +244,7 @@ const agent = new Agent({
 
 - `src/agent`: the agent loop and event flow.
 - `src/context`: system prompt construction, token estimation, request-view truncation, and history compaction.
+- `src/memory`: Workspace memory, Markdown long-term memory, static memory instructions, and memory tools.
 - `src/llm`: LLM interfaces, provider registry, env factory, and provider clients.
 - `src/tools`: tool registry, executor, validation, built-in tools, and core tool factories.
 - `examples`: runnable agent demo.

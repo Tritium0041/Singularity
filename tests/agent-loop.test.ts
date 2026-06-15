@@ -73,6 +73,34 @@ test("agent executes tool calls and feeds results back to the LLM", async () => 
   assert.equal(llm.requests[1]?.messages.at(-1)?.content, "456831");
 });
 
+test("agent can resume from configured history without sharing mutable message references", async () => {
+  const history: AssistantMessage[] = [
+    {
+      role: "assistant",
+      content: "Earlier answer."
+    }
+  ];
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "continued"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    history
+  });
+
+  history[0]!.content = "mutated outside";
+  await agent.run("Continue");
+
+  assert.equal(llm.requests[0]?.messages[0]?.role, "assistant");
+  assert.equal(llm.requests[0]?.messages[0]?.content, "Earlier answer.");
+  assert.equal(llm.requests[0]?.messages[1]?.role, "user");
+  assert.equal(llm.requests[0]?.messages[1]?.content, "Continue");
+});
+
 test("tool failures are returned as model-visible tool results", async () => {
   const llm = new SequenceLlm([
     {
@@ -338,6 +366,7 @@ test("agent marks assistant usage from a non-compacted request as reusable", asy
   const agent = new Agent({
     llm,
     model: "fake-model",
+    memory: false,
     context: { contextWindowTokens: 1000, reservedOutputTokens: 0 }
   });
 
@@ -563,6 +592,7 @@ test("automatic compaction preserves the live tool-call turn and tool guidance",
     llm,
     model: "fake-model",
     tools: [longTool],
+    memory: false,
     context: false
   });
 
@@ -658,6 +688,7 @@ test("agent emits request context metadata on turn_end", async () => {
   const agent = new Agent({
     llm,
     model: "fake-model",
+    memory: false,
     context: { contextWindowTokens: 1000, reservedOutputTokens: 0 },
     onEvent(event) {
       events.push(event);
