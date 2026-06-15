@@ -6,8 +6,10 @@ import {
   AgentSessionStore,
   createCoreTools,
   createLlmClientFromEnv,
+  generateSessionTitle,
   MarkdownMemoryStore,
   WorkspaceMemory,
+  type AgentMessage,
   type ContextEngineOptions,
   type AgentEvent,
   type AgentSessionRecord,
@@ -24,6 +26,7 @@ import {
 const DEFAULT_PROMPT = "Calculate (123 + 456) * 789, then tell me the result.";
 const CONFIG_PATH = ".agent-demo.json";
 const SESSION_DIR = ".agent-sessions";
+const DEFAULT_SESSION_TITLE = "Untitled session";
 
 type CliOptions = {
   help: boolean;
@@ -52,6 +55,10 @@ type DemoConfig = {
   compressionModel?: string;
   compressionApiKey?: string;
   compressionBaseURL?: string;
+  summaryProvider?: string;
+  summaryModel?: string;
+  summaryApiKey?: string;
+  summaryBaseURL?: string;
   tavilyApiKey?: string;
   dynamicCompression?: boolean;
   dynamicAutoSummarize?: boolean;
@@ -67,6 +74,7 @@ type DemoConfig = {
   memory?: boolean;
   memoryPath?: string;
   maxMemoryResults?: number;
+  phaseSummary?: boolean;
 };
 
 type DemoConfigKey = keyof DemoConfig;
@@ -83,6 +91,10 @@ const CONFIG_KEY_HELP: Record<DemoConfigKey, string> = {
   compressionModel: "compression model override",
   compressionApiKey: "compression provider API key",
   compressionBaseURL: "compression provider base URL",
+  summaryProvider: "summary provider override for session titles",
+  summaryModel: "summary model override for session titles",
+  summaryApiKey: "summary provider API key",
+  summaryBaseURL: "summary provider base URL",
   tavilyApiKey: "Tavily API key for the web_search tool",
   dynamicCompression: "true/false enable dynamic compression",
   dynamicAutoSummarize: "true/false enable background summary fallback",
@@ -97,7 +109,8 @@ const CONFIG_KEY_HELP: Record<DemoConfigKey, string> = {
   summarizeHistory: "true/false use model handoff summaries",
   memory: "true/false enable long-term Markdown memory store",
   memoryPath: "path for long-term Markdown memory store",
-  maxMemoryResults: "positive integer default search_memory result count"
+  maxMemoryResults: "positive integer default search_memory result count",
+  phaseSummary: "reserved; phase-summary memory is currently paused"
 };
 
 class SessionUsageLedger {
@@ -136,6 +149,14 @@ class SessionUsageLedger {
     this.latestContext = context;
     this.recordCompactionUsage(context?.compaction);
     return this.snapshot();
+  }
+
+  recordMemorySummary(event: Extract<AgentEvent, { type: "memory_summary_end" }>): SessionUsageSnapshot {
+    return this.recordSummaryUsage(event.usage);
+  }
+
+  recordSessionTitle(usage: TokenUsage | undefined): SessionUsageSnapshot {
+    return this.recordSummaryUsage(usage);
   }
 
   snapshot(): SessionUsageSnapshot {
@@ -183,6 +204,15 @@ class SessionUsageLedger {
     this.providerUsageTurns += 1;
     this.providerUsage = addTokenUsage(this.providerUsage, usage);
   }
+
+  private recordSummaryUsage(usage: TokenUsage | undefined): SessionUsageSnapshot {
+    if (usage) {
+      this.recordProviderUsage(usage);
+    } else {
+      this.usageUnavailableCalls += 1;
+    }
+    return this.snapshot();
+  }
 }
 
 const cli = parseCliOptions(process.argv.slice(2));
@@ -195,6 +225,7 @@ if (cli.help) {
 let demoConfig = loadDemoConfig();
 let llm = createMainLlmClient();
 let compressionLlm = createCompressionLlmClient(llm);
+let summaryLlm = createSummaryLlmClient(llm);
 let toolset = resolveToolset();
 let maxTurns = resolveMaxTurns();
 let displayState = createDisplayState();
@@ -205,6 +236,8 @@ let activeSession: AgentSessionRecord | undefined;
 let sessions = new AgentSessionStore({ dir: SESSION_DIR });
 let sessionPersistenceEnabled = false;
 let agent = createDemoAgent();
+let sessionWriteQueue: Promise<void> = Promise.resolve();
+const demoBackgroundTasks = new Set<Promise<void>>();
 
 if (cli.once || !stdin.isTTY) {
   renderBanner("one-shot");
@@ -238,7 +271,8 @@ function createDemoAgent(): Agent {
     memory: {
       workspace: workspaceMemory,
       store: createDemoMemoryStore(),
-      maxMemoryResults: demoConfig.maxMemoryResults
+      maxMemoryResults: demoConfig.maxMemoryResults,
+      phaseSummary: createDemoPhaseSummaryConfig()
     },
     history: activeSession?.messages,
     context: buildContextOptions(),
@@ -279,6 +313,27 @@ function createDemoAgent(): Agent {
         console.log(formatTurnTokenUsage(event, snapshot));
         printCompactionDetails(event.context?.compaction);
       }
+      if (event.type === "memory_summary_start") {
+        finishStreamingLine();
+        console.log(`[memory:summary] model=${event.model} messages=${event.messageCount} store=${event.storePath}`);
+      }
+      if (event.type === "memory_summary_end") {
+        finishStreamingLine();
+        const snapshot = usageLedger.recordMemorySummary(event);
+        console.log(
+          [
+            `[memory:summary] ${event.action}=${event.entry.id}`,
+            `tokens=${formatTokenCount(event.summaryTokens)}`,
+            `chars=${formatTokenCount(event.summaryChars)}`,
+            formatProviderUsage("provider", event.usage),
+            formatProviderUsage("session", snapshot.providerUsage)
+          ].join("; ")
+        );
+      }
+      if (event.type === "memory_summary_error") {
+        finishStreamingLine();
+        console.error(`[memory:summary:error] model=${event.model} store=${event.storePath} ${event.error}`);
+      }
     }
   });
 }
@@ -318,6 +373,7 @@ async function runUserPrompt(input: string): Promise<boolean> {
   if (sessionPersistenceEnabled) {
     await ensureActiveSession();
   }
+  const shouldNameSession = shouldGenerateSessionTitle(activeSession);
   exchangeCount += 1;
   displayState = createDisplayState();
   console.log(`\n[user ${exchangeCount}] ${input}`);
@@ -332,6 +388,7 @@ async function runUserPrompt(input: string): Promise<boolean> {
     if (result.stoppedBy === "max_turns") {
       console.log(`[stop] reached maxTurns=${result.turns}`);
     }
+    enqueueActiveSessionTitleAfterFirstRequest(shouldNameSession, result.messages);
     await saveActiveSession();
     return true;
   } catch (error) {
@@ -389,7 +446,7 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
     return "handled";
   }
   if (input === "/new") {
-    await createAndSwitchSession("Untitled session");
+    await createAndSwitchSession(DEFAULT_SESSION_TITLE);
     console.log(`[new] created session ${activeSession?.id}`);
     return "handled";
   }
@@ -407,7 +464,7 @@ async function restoreActiveSession(): Promise<void> {
   }
   if (!result.session) {
     if (result.warnings.length > 0) {
-      await createAndSwitchSession("Untitled session");
+      await createAndSwitchSession(DEFAULT_SESSION_TITLE);
       console.log(`[session] started fresh session ${activeSession?.id}`);
     }
     return;
@@ -425,7 +482,7 @@ async function ensureActiveSession(title?: string): Promise<AgentSessionRecord> 
 }
 
 async function createAndSwitchSession(title?: string): Promise<AgentSessionRecord> {
-  const session = await sessions.createSession({ title });
+  const session = await enqueueSessionWrite(() => sessions.createSession({ title }));
   switchToSession(session);
   return session;
 }
@@ -443,17 +500,114 @@ async function saveActiveSession(): Promise<void> {
     return;
   }
 
-  activeSession = await sessions.saveSession({
-    ...activeSession,
-    exchangeCount,
-    messages: [...agent.history],
-    workspace: workspaceMemory.state,
-    usage: usageLedger.snapshot()
+  await enqueueSessionWrite(async () => {
+    activeSession = await sessions.saveSession({
+      ...activeSession!,
+      exchangeCount,
+      messages: [...agent.history],
+      workspace: workspaceMemory.state,
+      usage: usageLedger.snapshot()
+    });
   });
 }
 
+function shouldGenerateSessionTitle(session: AgentSessionRecord | undefined): boolean {
+  return sessionPersistenceEnabled && session?.exchangeCount === 0 && session.title === DEFAULT_SESSION_TITLE;
+}
+
+function enqueueActiveSessionTitleAfterFirstRequest(shouldNameSession: boolean, messages: readonly AgentMessage[]): void {
+  if (!shouldNameSession || !activeSession) {
+    return;
+  }
+
+  const sessionId = activeSession.id;
+  const titleLlm = summaryLlm;
+  const reasoning = resolveReasoning();
+  const titleMessages = cloneAgentMessages(messages);
+  finishStreamingLine();
+  console.log(`[session:title] model=${titleLlm.model} messages=${titleMessages.length}`);
+  trackDemoBackgroundTask((async () => {
+    try {
+      const result = await generateSessionTitle({
+        llm: titleLlm.llm,
+        model: titleLlm.model,
+        messages: titleMessages,
+        reasoning
+      });
+      const snapshot = await applyGeneratedSessionTitle(sessionId, result.title, result.message.usage);
+      if (!snapshot) {
+        console.log(`[session:title] skipped session=${sessionId}`);
+        return;
+      }
+      console.log(
+        [
+          `[session:title] "${result.title}"`,
+          `tokens=${formatTokenCount(result.titleTokens)}`,
+          `chars=${formatTokenCount(result.titleChars)}`,
+          formatProviderUsage("provider", result.message.usage),
+          formatProviderUsage("session", snapshot.providerUsage)
+        ].join("; ")
+      );
+    } catch (error) {
+      console.error(`[session:title:error] model=${titleLlm.model} ${formatError(error)}`);
+    }
+  })());
+}
+
+async function applyGeneratedSessionTitle(
+  sessionId: string,
+  title: string,
+  usage: TokenUsage | undefined
+): Promise<SessionUsageSnapshot | undefined> {
+  return enqueueSessionWrite(async () => {
+    const session = await sessions.loadSession(sessionId);
+    const isActive = activeSession?.id === sessionId;
+    if (session.title !== DEFAULT_SESSION_TITLE || (isActive && activeSession?.title !== DEFAULT_SESSION_TITLE)) {
+      return undefined;
+    }
+
+    const diskSnapshot = new SessionUsageLedger(session.usage).recordSessionTitle(usage);
+    const activeSnapshot = isActive ? usageLedger.recordSessionTitle(usage) : undefined;
+    const saved = await sessions.saveSession(
+      {
+        ...session,
+        title,
+        usage: diskSnapshot
+      },
+      { active: isActive }
+    );
+
+    if (isActive && activeSession?.id === sessionId) {
+      activeSession = {
+        ...activeSession,
+        title: saved.title,
+        usage: activeSnapshot ?? saved.usage
+      };
+    }
+
+    return activeSnapshot ?? diskSnapshot;
+  });
+}
+
+function trackDemoBackgroundTask(task: Promise<void>): void {
+  demoBackgroundTasks.add(task);
+  task.finally(() => {
+    demoBackgroundTasks.delete(task);
+  }).catch(() => undefined);
+}
+
+function enqueueSessionWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const task = sessionWriteQueue.then(operation, operation);
+  sessionWriteQueue = task.then(() => undefined, () => undefined);
+  return task;
+}
+
+function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+  return JSON.parse(JSON.stringify(messages)) as AgentMessage[];
+}
+
 async function resetConversationToNewSession(reason: string): Promise<void> {
-  await createAndSwitchSession("Untitled session");
+  await createAndSwitchSession(DEFAULT_SESSION_TITLE);
   console.log(`${reason}; switched to fresh session ${activeSession?.id}`);
 }
 
@@ -503,7 +657,7 @@ async function handleSessionCommand(input: string): Promise<void> {
       const deletingActive = activeSession?.id === id;
       await sessions.deleteSession(id);
       if (deletingActive) {
-        await createAndSwitchSession("Untitled session");
+        await createAndSwitchSession(DEFAULT_SESSION_TITLE);
         console.log(`[session] deleted ${id}; created ${activeSession?.id}`);
       } else {
         console.log(`[session] deleted ${id}`);
@@ -630,6 +784,7 @@ async function runConfigCommand(input: string): Promise<void> {
 function reloadRuntimeFromConfig(): void {
   llm = createMainLlmClient();
   compressionLlm = createCompressionLlmClient(llm);
+  summaryLlm = createSummaryLlmClient(llm);
   toolset = resolveToolset();
   maxTurns = resolveMaxTurns();
   usageLedger = new SessionUsageLedger();
@@ -699,11 +854,14 @@ function renderBanner(mode: "tui" | "one-shot"): void {
   if (compressionLlm) {
     console.log(`compression_provider=${compressionLlm.provider} compression_model=${compressionLlm.model}`);
   }
+  console.log(`phase_summary=paused summary_provider=${summaryLlm.provider} summary_model=${summaryLlm.model}`);
   console.log(`toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
   if (mode === "tui") {
     console.log(`session=${activeSession ? `${activeSession.id} "${activeSession.title}"` : "(new on first message)"}`);
   }
-  console.log(`workspace_notes=${workspaceMemory.state.notes.length} memory_store=${demoConfig.memory ? createRequiredDemoMemoryStore().path : "off"}`);
+  console.log(
+    `workspace_notes=${workspaceMemory.state.notes.length} memory_store=${demoConfig.memory ? createRequiredDemoMemoryStore().path : "off"} phase_memory=off`
+  );
   if (mode === "tui") {
     console.log("commands=/help /usage /sessions /session /config /memory /notes /compact /new /clear /exit");
   }
@@ -721,6 +879,7 @@ Environment:
   AGENT_MAX_TURNS=<positive integer>
   AGENT_REASONING_EFFORT=minimal|low|medium|high|xhigh
   AGENT_COMPRESSION_PROVIDER, AGENT_COMPRESSION_MODEL
+  AGENT_SUMMARY_PROVIDER, AGENT_SUMMARY_MODEL
   AGENT_DYNAMIC_COMPRESSION=1
 
 Interactive commands:
@@ -763,6 +922,7 @@ Examples:
   /config set dynamicCompression true
   /config set memoryPath .agent-memory/MEMORY.md
   /config set maxMemoryResults 8
+  /config set summaryModel gpt-4.1-mini
   /config set compressionModel gpt-4.1-mini`);
 }
 
@@ -780,6 +940,7 @@ function printConfig(): void {
   } else {
     console.log("[config] compressionProvider=(main) compressionModel=(main)");
   }
+  console.log(`[config] phaseSummary=paused summaryProvider=${summaryLlm.provider} summaryModel=${summaryLlm.model}`);
   console.log(`[config] toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
   const context = buildContextOptions();
   console.log(`[config] dynamicCompression=${context?.dynamicCompression ? "true" : "false"}`);
@@ -802,7 +963,7 @@ function formatConfigValue(key: DemoConfigKey, value: DemoConfig[DemoConfigKey])
   if (value === undefined) {
     return "(unset)";
   }
-  if (key === "apiKey" || key === "compressionApiKey" || key === "tavilyApiKey") {
+  if (key === "apiKey" || key === "compressionApiKey" || key === "summaryApiKey" || key === "tavilyApiKey") {
     return maskSecret(String(value));
   }
   return String(value);
@@ -941,12 +1102,32 @@ function createCompressionLlmClient(main: EnvLlmClient): EnvLlmClient | undefine
   });
 }
 
+function createSummaryLlmClient(main: EnvLlmClient): EnvLlmClient {
+  const provider = firstNonEmpty(demoConfig.summaryProvider, process.env.AGENT_SUMMARY_PROVIDER);
+  const model = firstNonEmpty(demoConfig.summaryModel, process.env.AGENT_SUMMARY_MODEL);
+  const usesMainProvider = resolvesToProvider(provider, main.provider);
+  const apiKey = firstNonEmpty(demoConfig.summaryApiKey, process.env.AGENT_SUMMARY_API_KEY, usesMainProvider ? demoConfig.apiKey : undefined);
+  const baseURL = firstNonEmpty(demoConfig.summaryBaseURL, process.env.AGENT_SUMMARY_BASE_URL, usesMainProvider ? demoConfig.baseURL : undefined);
+
+  return createLlmClientFromEnv({
+    provider: provider ?? main.provider,
+    model: model ?? main.model,
+    apiKey,
+    baseURL
+  });
+}
+
 function createDemoMemoryStore(): MarkdownMemoryStore | undefined {
   return demoConfig.memory ? createRequiredDemoMemoryStore() : undefined;
 }
 
 function createRequiredDemoMemoryStore(): MarkdownMemoryStore {
   return new MarkdownMemoryStore({ path: resolveMemoryPath() });
+}
+
+function createDemoPhaseSummaryConfig(): false {
+  // Paused while the phase-summary memory shape is being redesigned.
+  return false;
 }
 
 function resolveMemoryPath(): string {
@@ -957,6 +1138,7 @@ function printMemoryStatus(): void {
   const store = createDemoMemoryStore();
   console.log(`[memory] workspace_notes=${workspaceMemory.state.notes.length}`);
   console.log(`[memory] long_term=${store ? "on" : "off"} store=${store?.path ?? "(disabled)"} maxResults=${demoConfig.maxMemoryResults ?? 5}`);
+  console.log("[memory] phase_summary=paused store=(disabled)");
 }
 
 function printWorkspaceNotes(): void {
@@ -1033,6 +1215,10 @@ function parseDynamicCompressionOptions(): ContextEngineOptions["dynamicCompress
     keepRecentTokens: demoConfig.dynamicKeepRecentTokens ?? parseOptionalPositiveInteger(process.env.AGENT_DYNAMIC_KEEP_RECENT_TOKENS, "AGENT_DYNAMIC_KEEP_RECENT_TOKENS"),
     minCompressMessages: demoConfig.dynamicMinMessages ?? parseOptionalPositiveInteger(process.env.AGENT_DYNAMIC_MIN_MESSAGES, "AGENT_DYNAMIC_MIN_MESSAGES")
   };
+}
+
+function resolvePhaseSummaryEnabled(): boolean {
+  return false;
 }
 
 function loadDemoConfig(): DemoConfig {
@@ -1127,13 +1313,17 @@ function isStringKey(key: DemoConfigKey): boolean {
     key === "compressionModel" ||
     key === "compressionApiKey" ||
     key === "compressionBaseURL" ||
+    key === "summaryProvider" ||
+    key === "summaryModel" ||
+    key === "summaryApiKey" ||
+    key === "summaryBaseURL" ||
     key === "tavilyApiKey" ||
     key === "memoryPath"
   );
 }
 
 function isBooleanKey(key: DemoConfigKey): boolean {
-  return key === "dynamicCompression" || key === "dynamicAutoSummarize" || key === "summarizeHistory" || key === "memory";
+  return key === "dynamicCompression" || key === "dynamicAutoSummarize" || key === "summarizeHistory" || key === "memory" || key === "phaseSummary";
 }
 
 function parseBooleanConfig(value: unknown, key: string): boolean {

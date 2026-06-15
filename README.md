@@ -12,7 +12,7 @@ Singularity is a minimal TypeScript agent runtime for experimenting with LLM too
 - Built-in basic, file, shell, and web/search tools.
 - Tool output truncation for large file, command, and URL results.
 - Context budgeting uses provider-reported token usage when available, can dynamically summarize stale history in the request view, and still falls back to one-shot no-tool handoff compaction for oversized histories.
-- Memory System v1 with current-task Workspace notes, an optional append-only Markdown memory store, and tool-only memory retrieval.
+- Memory System v1 with current-task Workspace notes, an optional Markdown memory store, and tool-only memory retrieval.
 
 ## Requirements
 
@@ -39,7 +39,7 @@ npm run build
 LLM_API_KEY=your_key_here npm run demo
 ```
 
-The demo opens a small terminal chat UI. Each TUI conversation is saved as a session under `.agent-sessions/`, and the next TUI launch resumes the active session from the last completed user exchange. The status line shows the active session, current provider token totals, and the latest context estimate. When context compaction runs, the demo prints the pre-compaction decision estimate, summary-call usage, and post-compaction context estimate.
+The demo opens a small terminal chat UI. Each TUI conversation is saved as a session under `.agent-sessions/`, and the next TUI launch resumes the active session from the last completed user exchange. After the first completed request in a new untitled session, the demo asks the summary model for a compact topic and stores it as the session title in the background. The status line shows the active session, current provider token totals, and the latest context estimate. When context compaction runs, the demo prints the pre-compaction decision estimate, summary-call usage, and post-compaction context estimate.
 
 You can pass an initial prompt and continue chatting:
 
@@ -97,6 +97,7 @@ The TUI config command stores overrides in local `.agent-demo.json`, which is ig
 /config set compressionModel gpt-4.1-mini
 /config set memoryPath .agent-memory/MEMORY.md
 /config set maxMemoryResults 8
+/config set summaryModel gpt-4.1-mini
 /config unset compressionModel
 /config reset
 ```
@@ -113,7 +114,7 @@ Memory commands:
 /forget-notes
 ```
 
-Workspace memory is enabled in the demo so the agent can call `write_note`, `read_note`, and `update_workspace` during a task. Long-term memory is off until `/memory on` or `/config set memory true` enables the Markdown store. The default store path is `.agent-memory/MEMORY.md`, which is ignored by git.
+Workspace memory is enabled in the demo so the agent can call `write_note`, `read_note`, and `update_workspace` during a task. Long-term memory retrieval is off until `/memory on` or `/config set memory true` enables the Markdown store tools. Session titles run as background work after the first completed request in a new untitled TUI session, so the next prompt is not blocked while the local title finishes. The default store path is `.agent-memory/MEMORY.md`, which is ignored by git.
 
 Optional environment variables:
 
@@ -127,6 +128,8 @@ Optional environment variables:
 - `AGENT_REASONING_EFFORT`: reasoning effort passed to supported models.
 - `AGENT_COMPRESSION_PROVIDER`: optional provider for context compression calls. Defaults to the main provider.
 - `AGENT_COMPRESSION_MODEL`: optional model for context compression calls. Defaults to the main model.
+- `AGENT_SUMMARY_PROVIDER`: optional provider for session-title calls. Defaults to the main provider.
+- `AGENT_SUMMARY_MODEL`: optional model for session-title calls. Defaults to the main model.
 - `AGENT_DYNAMIC_COMPRESSION`: set to `1`, `true`, `on`, or `yes` to enable dynamic request-view compression.
 - `AGENT_DYNAMIC_AUTO_SUMMARIZE`: optionally enable the older automatic prefix summary fallback. The default dynamic path is offloaded through `compact_context`.
 - `AGENT_DYNAMIC_TRIGGER_TOKENS`: optional token estimate threshold for dynamic compression.
@@ -200,6 +203,8 @@ const agent = new Agent({
 ```
 
 Workspace notes and long-term memory entries are never injected into the system prompt. The system prompt only contains static rules telling the model when to use memory tools. Actual memory content enters `agent.history` only as normal tool results from `read_note`, `store_memory`, or `search_memory`, so Context Engine truncation and compaction keep handling the short-term request view.
+
+Post-request `phase-summary` memory is currently paused while its shape is being redesigned. The related implementation files and config surface remain in the codebase, but `memory.phaseSummary` is ignored at runtime and the demo reports it as paused.
 
 ```ts
 const agent = new Agent({

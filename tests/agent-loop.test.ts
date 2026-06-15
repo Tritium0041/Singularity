@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Agent } from "../src/agent/agent-loop.js";
 import type { LlmClient, LlmRequest, LlmStreamEvent, StreamingLlmClient } from "../src/llm/types.js";
 import { OpenAIResponsesClient } from "../src/llm/openai-responses-client.js";
+import { MarkdownMemoryStore } from "../src/memory/index.js";
 import type { AgentEvent, AssistantMessage } from "../src/types.js";
 import { calculatorTool } from "../src/tools/builtins.js";
 import type { AgentTool } from "../src/tools/registry.js";
@@ -705,6 +709,58 @@ test("agent emits request context metadata on turn_end", async () => {
   assert.equal(turnEnd.context?.compacted, false);
   assert.equal(turnEnd.context?.tokenEstimateSource, "heuristic");
   assert.equal(typeof turnEnd.context?.estimatedInputTokens, "number");
+});
+
+test("agent ignores configured phase summary while the feature is paused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "singularity-phase-summary-"));
+  try {
+    const mainLlm = new SequenceLlm([
+      {
+        role: "assistant",
+        content: "Implemented the feature."
+      }
+    ]);
+    const summaryLlm = new SequenceLlm([
+      {
+        role: "assistant",
+        content: "This summary should not be requested.",
+        usage: { inputTokens: 30, outputTokens: 12, totalTokens: 42 }
+      }
+    ]);
+    const store = new MarkdownMemoryStore({ path: join(dir, "MEMORY.md") });
+    const events: AgentEvent[] = [];
+    const agent = new Agent({
+      llm: mainLlm,
+      model: "main-model",
+      tools: [calculatorTool],
+      memory: {
+        store,
+        phaseSummary: {
+          llm: summaryLlm,
+          model: "summary-model",
+          tags: ["test"]
+        }
+      },
+      onEvent(event) {
+        events.push(event);
+      }
+    });
+
+    const result = await agent.run("Please implement this");
+
+    assert.equal(result.output, "Implemented the feature.");
+    assert.equal(mainLlm.requests.length, 1);
+    await agent.waitForBackgroundTasks();
+    assert.equal(agent.history.length, 2);
+    assert.equal(summaryLlm.requests.length, 0);
+    assert.equal(events.some((event) => event.type === "memory_summary_start"), false);
+    assert.equal(events.some((event) => event.type === "memory_summary_end"), false);
+    assert.equal(events.some((event) => event.type === "memory_summary_error"), false);
+    const entries = await store.list({ tag: "phase-summary" });
+    assert.equal(entries.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("context false bypasses request-view truncation", async () => {

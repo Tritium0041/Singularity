@@ -1,4 +1,5 @@
 import type { ContextEngineOptions, ContextSummarySource, DynamicCompressionMetadata } from "./context/types.js";
+import type { MemoryEntry } from "./memory/types.js";
 
 export type JsonSchema = {
   type?: string;
@@ -126,6 +127,18 @@ export type AgentEvent =
       toolResults: ToolResultMessage[];
       context?: RequestContextMetadata;
     }
+  | { type: "memory_summary_start"; model: string; messageCount: number; storePath: string }
+  | {
+      type: "memory_summary_end";
+      model: string;
+      storePath: string;
+      entry: MemoryEntry;
+      action: "created" | "updated";
+      summaryTokens: number;
+      summaryChars: number;
+      usage?: TokenUsage;
+    }
+  | { type: "memory_summary_error"; model: string; storePath: string; error: string }
   | { type: "agent_end"; result: AgentRunResult };
 
 export type AgentEventSink = (event: AgentEvent) => void | Promise<void>;

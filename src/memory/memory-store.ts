@@ -58,6 +58,62 @@ export class MarkdownMemoryStore {
     return { ...entry, tags: [...entry.tags] };
   }
 
+  async update(input: { id: string; content: string; tags?: string[]; source?: MemoryEntrySource }): Promise<MemoryEntry> {
+    const content = normalizeContent(input.content);
+    const tags = normalizeTags(input.tags);
+    if (input.source !== undefined) {
+      validateSource(input.source);
+    }
+    await this.ensureFile();
+
+    const text = await readFile(this.filePath, "utf8");
+    const blocks = parseMemoryBlocks(text);
+    const target = blocks.find((block) => block.entry.id === input.id);
+    if (!target) {
+      throw new Error(`Memory entry not found: ${input.id}`);
+    }
+
+    const entry: MemoryEntry = {
+      ...target.entry,
+      content,
+      tags,
+      source: input.source,
+      updatedAt: new Date().toISOString()
+    };
+    const updated = replaceLines(text, target.entry.lineStart, target.entry.lineEnd, formatEntry(entry));
+    await writeFile(this.filePath, updated, "utf8");
+    return cloneEntry(entry);
+  }
+
+  async upsertByTag(input: { tag: string; content: string; tags?: string[]; source?: MemoryEntrySource }): Promise<{ entry: MemoryEntry; created: boolean }> {
+    const tag = normalizeTag(input.tag);
+    if (!tag) {
+      throw new Error("Memory upsert tag must be non-empty.");
+    }
+    const existing = (await this.list({ tag }))[0];
+    const tags = normalizeTags([tag, ...(input.tags ?? [])]);
+    if (!existing) {
+      return {
+        entry: await this.store({
+          content: input.content,
+          tags,
+          source: input.source
+        }),
+        created: true
+      };
+    }
+
+    return {
+      entry: await this.update({
+        id: existing.id,
+        content: input.content,
+        tags,
+        source: input.source ?? existing.source
+      }),
+      created: false
+    };
+  }
+
   async list(options: { limit?: number; tag?: string } = {}): Promise<MemoryEntry[]> {
     const entries = (await this.readBlocks()).map((block) => block.entry);
     const tag = options.tag === undefined ? undefined : normalizeTag(options.tag);
@@ -121,6 +177,21 @@ function formatEntry(entry: MemoryEntry): string {
     entry.content
   ];
   return lines.join("\n");
+}
+
+function replaceLines(text: string, lineStart: number | undefined, lineEnd: number | undefined, replacement: string): string {
+  if (!lineStart || !lineEnd || lineStart < 1 || lineEnd < lineStart) {
+    throw new Error("Memory entry is missing source line information.");
+  }
+
+  const hadTrailingNewline = text.endsWith("\n");
+  const lines = text.split("\n");
+  if (hadTrailingNewline) {
+    lines.pop();
+  }
+
+  lines.splice(lineStart - 1, lineEnd - lineStart, ...replacement.split("\n"));
+  return `${lines.join("\n")}\n`;
 }
 
 function parseMemoryBlocks(text: string): ParsedMemoryBlock[] {

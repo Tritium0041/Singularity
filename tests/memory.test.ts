@@ -137,6 +137,46 @@ test("markdown memory parser ignores non-memory markdown blocks", async () => {
   }
 });
 
+test("markdown memory store updates and upserts entries by tag", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "singularity-memory-upsert-"));
+  try {
+    const path = join(dir, "MEMORY.md");
+    const store = new MarkdownMemoryStore({ path });
+
+    const created = await store.upsertByTag({
+      tag: "phase-summary",
+      content: "Initial state.",
+      tags: ["workspace"],
+      source: "agent"
+    });
+    assert.equal(created.created, true);
+    assert.equal(created.entry.content, "Initial state.");
+
+    const updated = await store.upsertByTag({
+      tag: "phase-summary",
+      content: "Updated state.",
+      tags: ["workspace"],
+      source: "agent"
+    });
+    assert.equal(updated.created, false);
+    assert.equal(updated.entry.id, created.entry.id);
+    assert.equal(updated.entry.content, "Updated state.");
+    assert.equal(updated.entry.tags.includes("phase-summary"), true);
+    assert.equal(updated.entry.tags.includes("workspace"), true);
+
+    const entries = await store.list({ tag: "phase-summary" });
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.content, "Updated state.");
+
+    const text = await readFile(path, "utf8");
+    assert.equal((text.match(/^## mem_/gm) ?? []).length, 1);
+    assert.doesNotMatch(text, /Initial state/);
+    assert.match(text, /Updated state/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("memory tools share workspace and store instances", async () => {
   const dir = await mkdtemp(join(tmpdir(), "singularity-memory-tools-"));
   try {

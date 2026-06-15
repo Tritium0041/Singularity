@@ -30,10 +30,15 @@ import {
   createMemoryStoreTools,
   createWorkspaceTools,
   MarkdownMemoryStore,
+  PHASE_SUMMARY_TAG,
+  writePhaseSummaryToMemory,
   WorkspaceMemory,
+  type PhaseSummaryConfig,
   type WorkspaceState
 } from "../memory/index.js";
 import { ToolExecutor, ToolRegistry, type AgentTool, type ToolExecutionMode } from "../tools/registry.js";
+
+const PHASE_SUMMARY_RUNTIME_ENABLED = false;
 
 type PreparedAgentRequest = {
   request: LlmRequest;
@@ -64,6 +69,16 @@ export type AgentConfig = {
         store?: MarkdownMemoryStore | { path?: string };
         includeInstructions?: boolean;
         maxMemoryResults?: number;
+        phaseSummary?:
+          | false
+          | {
+              llm?: LlmClient;
+              model?: string;
+              reasoning?: ReasoningOptions | false;
+              store?: MarkdownMemoryStore | { path?: string };
+              prompt?: string;
+              tags?: string[];
+            };
       };
   onEvent?: AgentEventSink;
 };
@@ -73,6 +88,7 @@ type ResolvedAgentMemory = {
   store?: MarkdownMemoryStore;
   includeInstructions: boolean;
   maxMemoryResults: number;
+  phaseSummary?: PhaseSummaryConfig;
 };
 
 export class Agent {
@@ -91,6 +107,8 @@ export class Agent {
   private readonly messages: AgentMessage[] = [];
   private readonly dynamicCompressionState: DynamicCompressionState;
   private readonly memory: ResolvedAgentMemory | undefined;
+  private readonly backgroundTasks = new Set<Promise<void>>();
+  private phaseSummaryQueue: Promise<void> = Promise.resolve();
 
   constructor(config: AgentConfig) {
     this.llm = config.llm;
@@ -153,6 +171,12 @@ export class Agent {
     };
   }
 
+  async waitForBackgroundTasks(): Promise<void> {
+    while (this.backgroundTasks.size > 0) {
+      await Promise.all([...this.backgroundTasks]);
+    }
+  }
+
   async *runEvents(input: string, options: AgentRunOptions = {}): AsyncIterable<AgentEvent> {
     const events = new AsyncEventQueue<AgentEvent>();
     const runPromise = this.runInternal(input, options, (event) => {
@@ -211,6 +235,7 @@ export class Agent {
         const result = this.buildResult(assistant.content, turn, "final");
         await this.emit({ type: "turn_end", turn, message: assistant, toolResults: [], context: request.metadata?.context }, streamEventSink);
         await this.emit({ type: "agent_end", result }, streamEventSink);
+        this.enqueuePhaseSummary(result, options.signal, streamEventSink);
         return result;
       }
 
@@ -225,6 +250,7 @@ export class Agent {
 
     const result = this.buildResult(lastAssistant?.content ?? "", maxTurns, "max_turns");
     await this.emit({ type: "agent_end", result }, streamEventSink);
+    this.enqueuePhaseSummary(result, options.signal, streamEventSink);
     return result;
   }
 
@@ -386,11 +412,35 @@ export class Agent {
     }
 
     const memoryConfig = config ?? {};
+    const store = resolveMemoryStore(memoryConfig.store);
     return {
       workspace: resolveWorkspace(memoryConfig.workspace),
-      store: resolveMemoryStore(memoryConfig.store),
+      store,
       includeInstructions: memoryConfig.includeInstructions ?? true,
-      maxMemoryResults: clampMemoryResults(memoryConfig.maxMemoryResults ?? 5)
+      maxMemoryResults: clampMemoryResults(memoryConfig.maxMemoryResults ?? 5),
+      phaseSummary: this.resolvePhaseSummaryConfig(memoryConfig.phaseSummary, store)
+    };
+  }
+
+  private resolvePhaseSummaryConfig(
+    config: NonNullable<Exclude<AgentConfig["memory"], false>>["phaseSummary"],
+    defaultStore: MarkdownMemoryStore | undefined
+  ): PhaseSummaryConfig | undefined {
+    if (!PHASE_SUMMARY_RUNTIME_ENABLED) {
+      return undefined;
+    }
+    if (!config) {
+      return undefined;
+    }
+
+    const store = resolveMemoryStore(config.store) ?? defaultStore ?? new MarkdownMemoryStore();
+    return {
+      llm: config.llm ?? this.compressionLlm ?? this.llm,
+      model: config.model ?? this.compressionModel ?? this.model,
+      reasoning: config.reasoning ?? this.compressionReasoning,
+      store,
+      prompt: config.prompt,
+      tags: [PHASE_SUMMARY_TAG, ...(config.tags ?? [])]
     };
   }
 
@@ -454,6 +504,81 @@ export class Agent {
       turns,
       stoppedBy
     };
+  }
+
+  private enqueuePhaseSummary(
+    result: AgentRunResult,
+    signal: AbortSignal | undefined,
+    streamEventSink?: AgentEventSink
+  ): void {
+    if (!this.memory?.phaseSummary) {
+      return;
+    }
+
+    const task = this.phaseSummaryQueue.then(() => this.writePhaseSummary(result, signal, streamEventSink));
+    this.phaseSummaryQueue = task.catch(() => undefined);
+    this.trackBackgroundTask(this.phaseSummaryQueue);
+  }
+
+  private trackBackgroundTask(task: Promise<void>): void {
+    this.backgroundTasks.add(task);
+    task.finally(() => {
+      this.backgroundTasks.delete(task);
+    }).catch(() => undefined);
+  }
+
+  private async writePhaseSummary(
+    result: AgentRunResult,
+    signal: AbortSignal | undefined,
+    streamEventSink?: AgentEventSink
+  ): Promise<void> {
+    const phaseSummary = this.memory?.phaseSummary;
+    if (!phaseSummary) {
+      return;
+    }
+
+    await this.emit(
+      {
+        type: "memory_summary_start",
+        model: phaseSummary.model,
+        messageCount: result.messages.length,
+        storePath: phaseSummary.store.path
+      },
+      streamEventSink
+    );
+
+    try {
+      const summary = await writePhaseSummaryToMemory({
+        ...phaseSummary,
+        messages: result.messages,
+        turns: result.turns,
+        stoppedBy: result.stoppedBy,
+        signal
+      });
+      await this.emit(
+        {
+          type: "memory_summary_end",
+          model: phaseSummary.model,
+          storePath: phaseSummary.store.path,
+          entry: summary.entry,
+          action: summary.action,
+          summaryTokens: summary.summaryTokens,
+          summaryChars: summary.summaryChars,
+          usage: summary.message.usage
+        },
+        streamEventSink
+      );
+    } catch (error) {
+      await this.emit(
+        {
+          type: "memory_summary_error",
+          model: phaseSummary.model,
+          storePath: phaseSummary.store.path,
+          error: formatError(error)
+        },
+        streamEventSink
+      );
+    }
   }
 
   private async emit(event: Parameters<NonNullable<AgentEventSink>>[0], streamEventSink?: AgentEventSink): Promise<void> {
@@ -637,4 +762,8 @@ function clampMemoryResults(value: number): number {
 
 function cloneAgentMessage(message: AgentMessage): AgentMessage {
   return JSON.parse(JSON.stringify(message)) as AgentMessage;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

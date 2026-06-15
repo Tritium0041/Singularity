@@ -3,7 +3,24 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { AgentSessionStore, type AgentSessionRecord } from "../src/session/index.js";
+import { AgentSessionStore, generateSessionTitle, normalizeSessionTitle, type AgentSessionRecord } from "../src/session/index.js";
+import type { LlmClient, LlmRequest } from "../src/llm/types.js";
+import type { AssistantMessage } from "../src/types.js";
+
+class SequenceLlm implements LlmClient {
+  public readonly requests: LlmRequest[] = [];
+
+  constructor(private readonly responses: AssistantMessage[]) {}
+
+  async complete(request: LlmRequest): Promise<AssistantMessage> {
+    this.requests.push(request);
+    const response = this.responses.shift();
+    if (!response) {
+      throw new Error("No fake response left");
+    }
+    return response;
+  }
+}
 
 test("session store creates, lists, saves, loads, and renames sessions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "singularity-sessions-"));
@@ -173,4 +190,43 @@ test("session store validates malformed messages and workspace notes", async () 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("session title summary names first request history without tools", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: '"实现 session 自动命名。"',
+      usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 }
+    }
+  ]);
+
+  const result = await generateSessionTitle({
+    llm,
+    model: "summary-model",
+    messages: [
+      { role: "user", content: "对每个session在第一次user request结束时，总结一个主题" },
+      { role: "assistant", content: "已实现自动命名。" }
+    ],
+    reasoning: false
+  });
+
+  assert.equal(result.title, "实现 session 自动命名");
+  assert.equal(result.titleChars, "实现 session 自动命名".length);
+  assert.equal(result.message.usage?.totalTokens, 25);
+  assert.equal(llm.requests.length, 1);
+
+  const request = llm.requests[0];
+  assert.equal(request?.model, "summary-model");
+  assert.deepEqual(request?.tools, []);
+  assert.equal(request?.reasoning, false);
+  assert.match(request?.systemPrompt ?? "", /You name local coding-agent sessions/);
+  assert.equal(request?.messages[0]?.role, "user");
+  assert.match(request?.messages.at(-1)?.content ?? "", /Name this saved session/);
+});
+
+test("session title normalization keeps a compact single-line name", () => {
+  assert.equal(normalizeSessionTitle("Title: Planning Work.\nextra detail"), "Planning Work");
+  assert.equal(normalizeSessionTitle(""), "Untitled session");
+  assert.equal(normalizeSessionTitle("x".repeat(100)), "x".repeat(80));
 });
