@@ -12,7 +12,8 @@ export function buildMemoryInstructions(options: { hasWorkspace: boolean; hasSto
     lines.push("- Use search_memory before relying on remembered user preferences, project conventions, or prior solutions.");
   }
   if (options.hasWorkspace) {
-    lines.push("- Use read_note when continuing a long task and you need the current task workspace.");
+    lines.push("- Use list_notes to inspect current task workspace notes before reading full note content.");
+    lines.push("- Use read_note when you need the full content of specific workspace notes.");
     lines.push("- Use write_note for important current-task state that should survive context compaction.");
   }
   if (options.hasStore) {

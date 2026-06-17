@@ -38,6 +38,8 @@ test("workspace memory writes, reads, updates, deletes, and validates notes", ()
   assert.equal(first.kind, "note");
   assert.equal(first.content, "implementation detail");
   assert.equal(workspace.read({ id: first.id })[0]?.content, "implementation detail");
+  assert.deepEqual(workspace.list().map((note) => note.id), [first.id, second.id]);
+  assert.deepEqual(workspace.list({ kind: "decision" }).map((note) => note.id), [second.id]);
   assert.deepEqual(
     workspace.read({ kind: "decision" }).map((note) => note.id),
     [second.id]
@@ -54,6 +56,22 @@ test("workspace memory writes, reads, updates, deletes, and validates notes", ()
   const snapshot = workspace.state;
   snapshot.notes[0]!.content = "mutated outside";
   assert.equal(workspace.read({ id: first.id })[0]?.content, "Add tests.");
+});
+
+test("workspace memory lists compact note previews", () => {
+  const workspace = new WorkspaceMemory();
+  const note = workspace.write({
+    kind: "file",
+    content: "First line with enough detail.\n\nSecond line should be compacted away from raw whitespace."
+  });
+
+  const [listed] = workspace.list({ kind: "file", previewCharacters: 24 });
+
+  assert.equal(listed?.id, note.id);
+  assert.equal(listed?.kind, "file");
+  assert.equal(listed?.contentLength, Array.from(note.content).length);
+  assert.equal(listed?.preview, "First line with enough d...");
+  assert.equal(Object.hasOwn(listed ?? {}, "content"), false);
 });
 
 test("markdown memory store initializes, appends, lists, searches, and clears entries", async () => {
@@ -190,6 +208,15 @@ test("memory tools share workspace and store instances", async () => {
     assert.equal(writeResult.isError, undefined);
     assert.equal(workspace.read({ kind: "decision" }).length, 1);
 
+    const listResult = await workspaceExecutor.execute({
+      id: "call_list",
+      name: "list_notes",
+      arguments: { kind: "decision" }
+    });
+    assert.equal(listResult.isError, undefined);
+    assert.match(listResult.content, /Keep the API small/);
+    assert.doesNotMatch(listResult.content, /"content"/);
+
     const readResult = await workspaceExecutor.execute({
       id: "call_read",
       name: "read_note",
@@ -238,9 +265,11 @@ test("agent registers default workspace memory tools and instructions", async ()
 
   const request = llm.requests[0];
   assert.equal(request?.tools?.some((tool) => tool.name === "write_note"), true);
+  assert.equal(request?.tools?.some((tool) => tool.name === "list_notes"), true);
   assert.equal(request?.tools?.some((tool) => tool.name === "read_note"), true);
   assert.equal(request?.tools?.some((tool) => tool.name === "store_memory"), false);
   assert.match(request?.systemPrompt ?? "", /Memory tools are available/);
+  assert.match(request?.systemPrompt ?? "", /list_notes/);
   assert.match(request?.systemPrompt ?? "", /write_note/);
   assert.doesNotMatch(request?.systemPrompt ?? "", /store_memory/);
 });

@@ -10,6 +10,11 @@ export type WorkspaceNote = {
   updatedAt: string;
 };
 
+export type WorkspaceNoteListItem = Pick<WorkspaceNote, "id" | "kind" | "createdAt" | "updatedAt"> & {
+  preview: string;
+  contentLength: number;
+};
+
 export type WorkspaceState = {
   notes: WorkspaceNote[];
 };

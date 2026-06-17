@@ -1,4 +1,12 @@
-import { WORKSPACE_NOTE_KINDS, type WorkspaceNote, type WorkspaceNoteKind, type WorkspaceState } from "./types.js";
+import {
+  WORKSPACE_NOTE_KINDS,
+  type WorkspaceNote,
+  type WorkspaceNoteKind,
+  type WorkspaceNoteListItem,
+  type WorkspaceState
+} from "./types.js";
+
+export const DEFAULT_WORKSPACE_NOTE_PREVIEW_CHARS = 80;
 
 export class WorkspaceMemory {
   private readonly notes: WorkspaceNote[];
@@ -44,6 +52,23 @@ export class WorkspaceMemory {
       .map(cloneNote);
   }
 
+  list(filter: { kind?: WorkspaceNoteKind; previewCharacters?: number } = {}): WorkspaceNoteListItem[] {
+    if (filter.kind !== undefined) {
+      validateKind(filter.kind);
+    }
+    const previewCharacters = normalizePreviewCharacters(filter.previewCharacters ?? DEFAULT_WORKSPACE_NOTE_PREVIEW_CHARS);
+    return this.notes
+      .filter((note) => filter.kind === undefined || note.kind === filter.kind)
+      .map((note) => ({
+        id: note.id,
+        kind: note.kind,
+        preview: previewContent(note.content, previewCharacters),
+        contentLength: Array.from(note.content).length,
+        createdAt: note.createdAt,
+        updatedAt: note.updatedAt
+      }));
+  }
+
   update(input: { id: string; kind?: WorkspaceNoteKind; content?: string }): WorkspaceNote {
     const note = this.notes.find((candidate) => candidate.id === input.id);
     if (!note) {
@@ -84,6 +109,22 @@ function normalizeContent(content: string): string {
     throw new Error("Workspace note content must be non-empty.");
   }
   return normalized;
+}
+
+function normalizePreviewCharacters(value: number): number {
+  if (!Number.isFinite(value)) {
+    throw new Error("Workspace note preview length must be finite.");
+  }
+  return Math.min(200, Math.max(10, Math.floor(value)));
+}
+
+function previewContent(content: string, maxCharacters: number): string {
+  const compact = content.replace(/\s+/g, " ").trim();
+  const characters = Array.from(compact);
+  if (characters.length <= maxCharacters) {
+    return compact;
+  }
+  return `${characters.slice(0, maxCharacters).join("")}...`;
 }
 
 function validateKind(kind: string): asserts kind is WorkspaceNoteKind {

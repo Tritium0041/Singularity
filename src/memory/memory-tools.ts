@@ -5,6 +5,7 @@ import { normalizeTags } from "./memory-store.js";
 import type { WorkspaceMemory } from "./workspace.js";
 
 export const WRITE_NOTE_TOOL_NAME = "write_note";
+export const LIST_NOTES_TOOL_NAME = "list_notes";
 export const READ_NOTE_TOOL_NAME = "read_note";
 export const UPDATE_WORKSPACE_TOOL_NAME = "update_workspace";
 export const STORE_MEMORY_TOOL_NAME = "store_memory";
@@ -39,6 +40,28 @@ export function createWorkspaceTools(workspace: WorkspaceMemory): AgentTool[] {
           content: readStringArg(args, "content")
         });
         return jsonToolResult(note);
+      }
+    },
+    {
+      name: LIST_NOTES_TOOL_NAME,
+      description:
+        "List compact summaries of notes in the current task workspace. Use this to discover note ids and distinguish notes before reading full content.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          kind: {
+            type: "string",
+            enum: [...WORKSPACE_NOTE_KINDS],
+            description: "Optional note kind filter."
+          }
+        }
+      },
+      execute(args) {
+        const notes = workspace.list({
+          kind: readOptionalWorkspaceKind(args, "kind")
+        });
+        return jsonToolResult({ notes });
       }
     },
     {
