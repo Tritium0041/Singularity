@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage, AssistantContextMetadata, ReasoningOutput, RequestContextMetadata, TokenUsage, ToolCall } from "../types.js";
 import { WORKSPACE_NOTE_KINDS, type WorkspaceNote, type WorkspaceState } from "../memory/index.js";
+import { Planner, type PlanState } from "../planning/index.js";
 
 export type AgentSessionUsageSnapshot = {
   assistantTurns: number;
@@ -21,6 +22,9 @@ export type AgentSessionRecord = {
   exchangeCount: number;
   messages: AgentMessage[];
   workspace: WorkspaceState;
+  planning?: {
+    plan?: PlanState;
+  };
   usage: AgentSessionUsageSnapshot;
 };
 
@@ -106,6 +110,7 @@ export class AgentSessionStore {
       exchangeCount: 0,
       messages: [],
       workspace: { notes: [] },
+      planning: {},
       usage: emptyUsageSnapshot()
     };
 
@@ -245,7 +250,21 @@ function parseSessionRecord(value: unknown): AgentSessionRecord {
     exchangeCount: expectNonNegativeInteger(object.exchangeCount, "session record exchangeCount"),
     messages: object.messages.map(parseAgentMessage),
     workspace: parseWorkspaceState(object.workspace),
+    planning: parsePlanningState(object.planning),
     usage: parseUsageSnapshot(object.usage)
+  };
+}
+
+function parsePlanningState(value: unknown): AgentSessionRecord["planning"] {
+  if (value === undefined) {
+    return undefined;
+  }
+  const object = expectObject(value, "planning state");
+  if (object.plan === undefined) {
+    return {};
+  }
+  return {
+    plan: new Planner(object.plan as PlanState).state
   };
 }
 

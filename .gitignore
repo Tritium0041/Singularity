@@ -6,5 +6,6 @@ coverage/
 .agent-sessions/
 .DS_Store
 sources/
+.humandocs
 *.md
 !README.md

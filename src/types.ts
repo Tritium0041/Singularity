@@ -1,5 +1,6 @@
 import type { ContextEngineOptions, ContextSummarySource, DynamicCompressionMetadata } from "./context/types.js";
 import type { MemoryEntry } from "./memory/types.js";
+import type { PlanState } from "./planning/types.js";
 
 export type JsonSchema = {
   type?: string;
@@ -147,7 +148,8 @@ export type AgentRunResult = {
   output: string;
   messages: AgentMessage[];
   turns: number;
-  stoppedBy: "final" | "max_turns";
+  stoppedBy: "final" | "max_turns" | "plan_review";
+  plan?: PlanState;
 };
 
 export type AgentRunOptions = {
@@ -155,6 +157,7 @@ export type AgentRunOptions = {
   reasoning?: ReasoningOptions | false;
   context?: false | Partial<ContextEngineOptions>;
   signal?: AbortSignal;
+  forcePlan?: boolean;
 };
 
 export type AgentCompactOptions = {

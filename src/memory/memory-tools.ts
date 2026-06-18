@@ -17,6 +17,7 @@ export function createWorkspaceTools(workspace: WorkspaceMemory): AgentTool[] {
       name: WRITE_NOTE_TOOL_NAME,
       description:
         "Write a note to the current task workspace. Use this for important current-task state that should survive context compaction.",
+      access: "write",
       executionMode: "sequential",
       parameters: {
         type: "object",
@@ -46,6 +47,7 @@ export function createWorkspaceTools(workspace: WorkspaceMemory): AgentTool[] {
       name: LIST_NOTES_TOOL_NAME,
       description:
         "List compact summaries of notes in the current task workspace. Use this to discover note ids and distinguish notes before reading full content.",
+      access: "read",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -67,6 +69,7 @@ export function createWorkspaceTools(workspace: WorkspaceMemory): AgentTool[] {
     {
       name: READ_NOTE_TOOL_NAME,
       description: "Read notes from the current task workspace by optional id or kind filter.",
+      access: "read",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -93,6 +96,7 @@ export function createWorkspaceTools(workspace: WorkspaceMemory): AgentTool[] {
     {
       name: UPDATE_WORKSPACE_TOOL_NAME,
       description: "Update or delete a note in the current task workspace.",
+      access: "write",
       executionMode: "sequential",
       parameters: {
         type: "object",
@@ -142,6 +146,7 @@ export function createMemoryStoreTools(store: MarkdownMemoryStore, options: { ma
       name: STORE_MEMORY_TOOL_NAME,
       description:
         "Store durable long-term memory as a local Markdown entry. Only save user preferences, project conventions, or reusable lessons. Never store secrets, credentials, or one-off temporary facts.",
+      access: "write",
       executionMode: "sequential",
       parameters: {
         type: "object",
@@ -177,6 +182,7 @@ export function createMemoryStoreTools(store: MarkdownMemoryStore, options: { ma
       name: SEARCH_MEMORY_TOOL_NAME,
       description:
         "Search durable long-term memory for remembered user preferences, project conventions, and prior reusable solutions. Use this before relying on memory.",
+      access: "read",
       parameters: {
         type: "object",
         additionalProperties: false,

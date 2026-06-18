@@ -41,6 +41,21 @@ type CommandExecution = {
   durationMs: number;
 };
 
+type DirectoryEntry = {
+  name: string;
+  type: "directory" | "file" | "other";
+  size: number;
+};
+
+type SearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+  score?: number;
+};
+
+const WEB_SEARCH_SNIPPET_CHARS = 600;
+
 export function createFileSystemTools(options: FileSystemToolsOptions = {}): AgentTool[] {
   const rootDir = options.rootDir ?? process.cwd();
   const truncationOptions = toTruncationOptions(options);
@@ -50,6 +65,7 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
       name: "read_file",
       description:
         "Read a UTF-8 text file under rootDir. Supports 1-indexed offset and line limit. Large output is truncated from the head.",
+      access: "read",
       parameters: {
         type: "object",
         properties: {
@@ -99,6 +115,7 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
     {
       name: "write_file",
       description: "Write UTF-8 content to a file under rootDir, creating parent directories and overwriting existing content.",
+      access: "write",
       parameters: {
         type: "object",
         properties: {
@@ -124,6 +141,7 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
     {
       name: "append_file",
       description: "Append UTF-8 content to a file under rootDir, creating parent directories and the file if needed.",
+      access: "write",
       parameters: {
         type: "object",
         properties: {
@@ -148,11 +166,13 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
     },
     {
       name: "list_directory",
-      description: "List a directory under rootDir as structured JSON with name, type, and size. Output is sorted and entry-limited.",
+      description: "List a directory under rootDir as compact text with name, type, and size. Output is sorted and entry-limited.",
+      access: "read",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "Directory to list. Defaults to rootDir." },
+          offset: { type: "number", description: "0-indexed sorted entry offset. Defaults to 0." },
           limit: { type: "number", description: "Maximum number of entries to return. Defaults to 500." }
         },
         required: [],
@@ -160,6 +180,7 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
       },
       async execute(args) {
         const rawPath = readOptionalStringArg(args, "path") ?? ".";
+        const offset = Math.max(0, Math.floor(readOptionalNumberArg(args, "offset") ?? 0));
         const limit = Math.max(1, Math.floor(readOptionalNumberArg(args, "limit") ?? 500));
         const path = resolveWithinRoot(rootDir, rawPath);
         const metadata = await stat(path);
@@ -168,8 +189,8 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
         }
 
         const dirents = (await readdir(path, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
-        const entries = [];
-        for (const dirent of dirents.slice(0, limit)) {
+        const entries: DirectoryEntry[] = [];
+        for (const dirent of dirents.slice(offset, offset + limit)) {
           const childPath = resolveWithinRoot(path, dirent.name);
           const childStat = await stat(childPath);
           entries.push({
@@ -178,14 +199,19 @@ export function createFileSystemTools(options: FileSystemToolsOptions = {}): Age
             size: childStat.size
           });
         }
-        const entryLimitReached = dirents.length > entries.length;
+        const nextOffset = offset + entries.length < dirents.length ? offset + entries.length : undefined;
+        const entryLimitReached = nextOffset !== undefined;
         const payload = {
           path,
           entries,
+          offset,
+          limit,
           entryLimitReached,
-          totalEntries: dirents.length
+          totalEntries: dirents.length,
+          nextOffset
         };
-        const truncated = truncateHead(JSON.stringify(payload, null, 2), truncationOptions);
+        const formatted = formatDirectoryListing(payload);
+        const truncated = truncateHead(formatted, truncationOptions);
         return {
           content:
             truncated.content +
@@ -209,6 +235,7 @@ export function createShellTool(options: ShellToolOptions = {}): AgentTool {
     name: "execute_command",
     description:
       "Execute a shell command in a workdir under rootDir. Captures stdout, stderr, exit code, timeout, and duration. This is not a security sandbox.",
+    access: "execute",
     executionMode: "sequential",
     parameters: {
       type: "object",
@@ -248,6 +275,7 @@ export function createWebTools(options: WebToolsOptions = {}): AgentTool[] {
     {
       name: "web_search",
       description: "Search the web through Tavily and return structured title, URL, and snippet results.",
+      access: "read",
       parameters: {
         type: "object",
         properties: {
@@ -296,8 +324,9 @@ export function createWebTools(options: WebToolsOptions = {}): AgentTool[] {
           snippet: result.content ?? "",
           score: result.score
         }));
+        const formatted = formatSearchResults(query, results);
         return {
-          content: JSON.stringify({ query, results }, null, 2),
+          content: formatted,
           details: { query, results, raw: body }
         };
       }
@@ -305,6 +334,7 @@ export function createWebTools(options: WebToolsOptions = {}): AgentTool[] {
     {
       name: "fetch_url",
       description: "Fetch an HTTP(S) URL and return readable text. HTML pages are converted to body text and truncated from the head.",
+      access: "read",
       parameters: {
         type: "object",
         properties: {
@@ -461,10 +491,66 @@ function formatCommandResult(result: CommandExecution, options: TruncationOption
   };
 }
 
+function formatDirectoryListing(payload: {
+  path: string;
+  entries: DirectoryEntry[];
+  offset: number;
+  limit: number;
+  entryLimitReached: boolean;
+  totalEntries: number;
+  nextOffset?: number;
+}): string {
+  const shownStart = payload.entries.length === 0 ? 0 : payload.offset + 1;
+  const shownEnd = payload.entries.length === 0 ? 0 : payload.offset + payload.entries.length;
+  const lines = [
+    `Directory: ${payload.path}`,
+    `Entries: ${payload.entries.length} shown (${shownStart}-${shownEnd}) of ${payload.totalEntries}; offset=${payload.offset} limit=${payload.limit}`,
+    ...(payload.entryLimitReached && payload.nextOffset !== undefined
+      ? [`More entries available. Re-run list_directory with offset=${payload.nextOffset} limit=${payload.limit}.`]
+      : []),
+    "type\tsize\tname",
+    ...payload.entries.map((entry) => `${entry.type}\t${entry.size}\t${entry.name}`)
+  ];
+
+  return lines.join("\n");
+}
+
+function formatSearchResults(query: string, results: SearchResult[]): string {
+  const lines = [`Search: ${query}`, `Results: ${results.length}`];
+  for (const [index, result] of results.entries()) {
+    const title = result.title || "(untitled)";
+    lines.push(`${index + 1}. ${title}`);
+    if (result.url) {
+      lines.push(`URL: ${result.url}`);
+    }
+    if (result.score !== undefined) {
+      lines.push(`Score: ${result.score}`);
+    }
+    const snippet = truncateSnippet(result.snippet);
+    if (snippet) {
+      lines.push(`Snippet: ${snippet}`);
+    }
+    if (index < results.length - 1) {
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+function truncateSnippet(snippet: string): string {
+  const compact = snippet.replace(/\s+/g, " ").trim();
+  if (compact.length <= WEB_SEARCH_SNIPPET_CHARS) {
+    return compact;
+  }
+  return `${compact.slice(0, WEB_SEARCH_SNIPPET_CHARS).trimEnd()} [snippet truncated]`;
+}
+
 function htmlToText(html: string): string {
   const $ = load(html);
   $("script, style, noscript").remove();
   const title = $("title").first().text().trim();
+  $("br").replaceWith("\n");
+  $("h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, td, th, div, main, section, article").after("\n");
   const bodyText = $("body").text();
   const lines = bodyText
     .replace(/\r/g, "")

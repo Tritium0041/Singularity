@@ -1,4 +1,5 @@
 import type { AgentMessage, ToolResultMessage } from "../types.js";
+import { truncateHead, truncateTail } from "../tools/truncation.js";
 import { estimateMessagesTokens } from "./token-estimator.js";
 import type { ResolvedContextEngineOptions } from "./types.js";
 
@@ -140,8 +141,12 @@ function isHandoffSummaryMessage(content: string): boolean {
 function truncateByChars(text: string, maxChars: number, direction: "head" | "tail"): string {
   const marker = `[ContextEngine truncated tool result; showing ${direction} of ${text.length} chars.]`;
   const bodyChars = Math.max(1, maxChars - marker.length - 2);
+  const truncated =
+    direction === "tail"
+      ? truncateTail(text, { maxBytes: bodyChars, maxLines: Number.MAX_SAFE_INTEGER })
+      : truncateHead(text, { maxBytes: bodyChars, maxLines: Number.MAX_SAFE_INTEGER });
   if (direction === "tail") {
-    return `${marker}\n${text.slice(-bodyChars)}`;
+    return `${marker}\n${truncated.content}`;
   }
-  return `${text.slice(0, bodyChars)}\n${marker}`;
+  return `${truncated.content}\n${marker}`;
 }

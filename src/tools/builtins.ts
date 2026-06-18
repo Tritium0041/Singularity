@@ -3,6 +3,7 @@ import type { AgentTool } from "./registry.js";
 export const calculatorTool: AgentTool = {
   name: "calculator",
   description: "Evaluate a basic arithmetic expression.",
+  access: "read",
   parameters: {
     type: "object",
     properties: {
@@ -32,6 +33,7 @@ export const calculatorTool: AgentTool = {
 export const mockWeatherTool: AgentTool = {
   name: "get_weather",
   description: "Return deterministic mock weather for a city.",
+  access: "read",
   parameters: {
     type: "object",
     properties: {

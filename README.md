@@ -60,6 +60,7 @@ Interactive commands:
 - `/session`: show or manage saved sessions.
 - `/config`: show or change demo settings without restarting with new environment variables.
 - `/memory`: show, enable, or disable the long-term Markdown memory store.
+- `/plan`: show, approve, run, or clear the current structured plan.
 - `/notes`: show current Workspace notes.
 - `/forget-notes`: clear current Workspace notes.
 - `/compact`: manually summarize and compact the current conversation history.
@@ -79,6 +80,18 @@ Session commands:
 ```
 
 Session files keep short-term conversation history, Workspace notes, exchange counters, and usage telemetry. They do not include the long-term Markdown memory store, which remains separate in `.agent-memory/`.
+
+Plan mode is always available in the demo. For complex requests, the agent can decide to create a plan on its own. To force plan mode, add `#plan` anywhere in a request or use `/plan run <request>`. After a plan is created, the run pauses with the plan details and waits for review before execution tools are exposed. Use `/plan approve` to approve the pending plan and continue execution immediately, or reply with requested changes.
+
+Plan commands:
+
+```txt
+/plan
+/plan json
+/plan run Update README after inspecting the code
+/plan approve Looks good
+/plan clear
+```
 
 The TUI config command stores overrides in local `.agent-demo.json`, which is ignored by git:
 

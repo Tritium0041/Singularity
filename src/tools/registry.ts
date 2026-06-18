@@ -14,10 +14,13 @@ export type ToolExecutionContext = {
 
 export type ToolExecutionMode = "sequential" | "parallel";
 
+export type ToolAccess = "read" | "write" | "execute" | "planner";
+
 export type AgentTool = {
   name: string;
   description: string;
   parameters: JsonSchema;
+  access?: ToolAccess;
   executionMode?: ToolExecutionMode;
   execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult> | ToolResult;
 };

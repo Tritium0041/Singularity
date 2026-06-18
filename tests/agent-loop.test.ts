@@ -7,8 +7,10 @@ import { Agent } from "../src/agent/agent-loop.js";
 import type { LlmClient, LlmRequest, LlmStreamEvent, StreamingLlmClient } from "../src/llm/types.js";
 import { OpenAIResponsesClient } from "../src/llm/openai-responses-client.js";
 import { MarkdownMemoryStore } from "../src/memory/index.js";
+import { APPROVE_PLAN_TOOL_NAME, CREATE_PLAN_TOOL_NAME, UPDATE_PLAN_STEP_TOOL_NAME, Planner } from "../src/planning/index.js";
 import type { AgentEvent, AssistantMessage } from "../src/types.js";
 import { calculatorTool } from "../src/tools/builtins.js";
+import { createFileSystemTools, createShellTool } from "../src/tools/core-tools.js";
 import type { AgentTool } from "../src/tools/registry.js";
 
 class SequenceLlm implements LlmClient {
@@ -234,6 +236,462 @@ test("invalid tool arguments are returned as tool errors", async () => {
   }
   assert.equal(toolMessage.isError, true);
   assert.match(toolMessage.content, /must be a string/);
+});
+
+test("planning without a plan exposes only read tools plus create/read plan", async () => {
+  const readTool: AgentTool = {
+    name: "custom_read",
+    description: "Read only",
+    access: "read",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      return { content: "read" };
+    }
+  };
+  const unknownTool: AgentTool = {
+    name: "custom_unknown",
+    description: "Unannotated custom tool",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      return { content: "unknown" };
+    }
+  };
+  const llm = new SequenceLlm([{ role: "assistant", content: "ready" }]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [readTool, unknownTool, ...createFileSystemTools(), createShellTool()],
+    memory: { store: new MarkdownMemoryStore() },
+    planning: {}
+  });
+
+  await agent.run("plan this");
+  const toolNames = new Set(llm.requests[0]?.tools?.map((tool) => tool.name));
+
+  assert.equal(toolNames.has("custom_read"), true);
+  assert.equal(toolNames.has("read_file"), true);
+  assert.equal(toolNames.has("list_directory"), true);
+  assert.equal(toolNames.has("create_plan"), true);
+  assert.equal(toolNames.has("read_plan"), true);
+  assert.equal(toolNames.has("custom_unknown"), false);
+  assert.equal(toolNames.has("write_file"), false);
+  assert.equal(toolNames.has("append_file"), false);
+  assert.equal(toolNames.has("execute_command"), false);
+  assert.equal(toolNames.has("write_note"), false);
+  assert.equal(toolNames.has("store_memory"), false);
+  assert.equal(toolNames.has("update_plan_step"), false);
+  assert.match(llm.requests[0]?.systemPrompt ?? "", /Planning tools are available/);
+  assert.doesNotMatch(llm.requests[0]?.systemPrompt ?? "", /<current_plan/);
+});
+
+test("forcePlan run option injects an explicit plan-mode directive", async () => {
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "call_plan",
+          name: CREATE_PLAN_TOOL_NAME,
+          arguments: {
+            objective: "Forced plan",
+            steps: [{ id: "inspect", title: "Inspect first" }]
+          }
+        }
+      ]
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    planning: {}
+  });
+
+  const result = await agent.run("do this in plan mode", { forcePlan: true, maxTurns: 1 });
+
+  assert.equal(result.stoppedBy, "plan_review");
+  assert.match(llm.requests[0]?.systemPrompt ?? "", /<runtime_plan_mode forced="true">/);
+  assert.equal(result.plan?.reviewStatus, "pending");
+});
+
+test("planning remains optional when forcePlan is absent", async () => {
+  const llm = new SequenceLlm([{ role: "assistant", content: "simple answer" }]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    planning: {}
+  });
+
+  const result = await agent.run("simple answer please");
+
+  assert.equal(result.stoppedBy, "final");
+  assert.doesNotMatch(llm.requests[0]?.systemPrompt ?? "", /<runtime_plan_mode/);
+});
+
+test("planning gate blocks mutation before create_plan and pauses for plan review", async () => {
+  const planner = new Planner();
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_blocked", name: "write_file", arguments: { path: "x.txt", content: "x" } }]
+    },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "call_plan",
+          name: CREATE_PLAN_TOOL_NAME,
+          arguments: {
+            objective: "Write file",
+            steps: [{ id: "write", title: "Write file" }]
+          }
+        }
+      ]
+    },
+    {
+      role: "assistant",
+      content: "should pause before this"
+    }
+  ]);
+  const writeTool: AgentTool = {
+    name: "write_file",
+    description: "Fake write",
+    access: "write",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" }
+      },
+      required: ["path", "content"],
+      additionalProperties: false
+    },
+    execute() {
+      return { content: "wrote" };
+    }
+  };
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [writeTool],
+    planning: { planner }
+  });
+
+  const result = await agent.run("write a file", { maxTurns: 4 });
+
+  assert.equal(result.stoppedBy, "plan_review");
+  assert.match(result.output, /Plan ready for review/);
+  const firstToolResult = llm.requests[1]?.messages.at(-1);
+  assert.equal(firstToolResult?.role, "tool");
+  if (firstToolResult?.role !== "tool") {
+    throw new Error("Expected tool result");
+  }
+  assert.equal(firstToolResult.isError, true);
+  assert.match(firstToolResult.content, /Tool not found: write_file/);
+  assert.equal(planner.state?.objective, "Write file");
+  assert.equal(planner.state?.reviewStatus, "pending");
+  assert.equal(llm.requests[2], undefined);
+  assert.equal(result.plan?.objective, "Write file");
+  assert.equal(result.plan?.reviewStatus, "pending");
+  assert.equal(result.plan?.steps[0]?.status, "pending");
+});
+
+test("approved plan opens mutation tools and keeps open-step guard", async () => {
+  const planner = new Planner();
+  planner.create({
+    objective: "Write file",
+    steps: [{ id: "write", title: "Write file" }]
+  });
+  planner.approve({ note: "user approved" });
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_write", name: "write_file", arguments: { path: "x.txt", content: "x" } }]
+    },
+    {
+      role: "assistant",
+      content: "done"
+    },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "call_complete_plan",
+          name: UPDATE_PLAN_STEP_TOOL_NAME,
+          arguments: { id: "write", status: "completed", appendEvidence: ["write_file returned wrote"] }
+        }
+      ]
+    },
+    {
+      role: "assistant",
+      content: "done"
+    }
+  ]);
+  const writeTool: AgentTool = {
+    name: "write_file",
+    description: "Fake write",
+    access: "write",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" }
+      },
+      required: ["path", "content"],
+      additionalProperties: false
+    },
+    execute() {
+      return { content: "wrote" };
+    }
+  };
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [writeTool],
+    planning: { planner }
+  });
+
+  const result = await agent.run("continue after approval", { maxTurns: 4 });
+
+  assert.equal(result.output, "done");
+  assert.match(llm.requests[0]?.systemPrompt ?? "", /review_status="approved"/);
+  assert.equal(llm.requests[0]?.tools?.some((tool) => tool.name === "write_file"), true);
+  assert.equal(llm.requests[1]?.messages.at(-1)?.role, "tool");
+  assert.equal(llm.requests[1]?.messages.at(-1)?.content, "wrote");
+  assert.equal(llm.requests[2]?.messages.at(-1)?.role, "tool");
+  assert.match(llm.requests[2]?.messages.at(-1)?.content ?? "", /Plan mode guard/);
+  assert.equal(result.plan?.steps[0]?.status, "completed");
+});
+
+test("plan approval can resume the model loop as a visible tool result", async () => {
+  const planner = new Planner();
+  planner.create({
+    objective: "Write file after review",
+    steps: [{ id: "write", title: "Write file" }]
+  });
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_write", name: "write_file", arguments: { path: "x.txt", content: "x" } }]
+    },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "call_complete_plan",
+          name: UPDATE_PLAN_STEP_TOOL_NAME,
+          arguments: { id: "write", status: "completed", appendEvidence: ["write_file returned wrote"] }
+        }
+      ]
+    },
+    {
+      role: "assistant",
+      content: "done"
+    }
+  ]);
+  const events: AgentEvent[] = [];
+  const writeTool: AgentTool = {
+    name: "write_file",
+    description: "Fake write",
+    access: "write",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" }
+      },
+      required: ["path", "content"],
+      additionalProperties: false
+    },
+    execute() {
+      return { content: "wrote" };
+    }
+  };
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [writeTool],
+    planning: { planner },
+    onEvent(event) {
+      events.push(event);
+    }
+  });
+
+  const result = await agent.continueWithToolCall(
+    { id: "call_approve_plan", name: APPROVE_PLAN_TOOL_NAME, arguments: { note: "Looks good" } },
+    { maxTurns: 4 }
+  );
+
+  assert.equal(result.output, "done");
+  assert.equal(result.stoppedBy, "final");
+  assert.equal(planner.state?.reviewStatus, "approved");
+  assert.equal(result.plan?.steps[0]?.status, "completed");
+  assert.equal(llm.requests.length, 3);
+  assert.equal(llm.requests[0]?.messages.some((message) => message.role === "user"), false);
+  const approvalAssistant = llm.requests[0]?.messages.at(-2);
+  assert.equal(approvalAssistant?.role, "assistant");
+  if (approvalAssistant?.role !== "assistant") {
+    throw new Error("Expected synthetic approval assistant message");
+  }
+  assert.equal(approvalAssistant.toolCalls?.[0]?.name, APPROVE_PLAN_TOOL_NAME);
+  const approvalResult = llm.requests[0]?.messages.at(-1);
+  assert.equal(approvalResult?.role, "tool");
+  if (approvalResult?.role !== "tool") {
+    throw new Error("Expected approval tool result");
+  }
+  assert.equal(approvalResult.toolName, APPROVE_PLAN_TOOL_NAME);
+  assert.match(approvalResult.content, /Plan approved/);
+  assert.equal(llm.requests[0]?.tools?.some((tool) => tool.name === "write_file"), true);
+  assert.equal(llm.requests[1]?.messages.at(-1)?.role, "tool");
+  assert.equal(llm.requests[1]?.messages.at(-1)?.content, "wrote");
+  assert.deepEqual(
+    events.filter((event) => event.type === "agent_start").map((event) => event.input),
+    ["[tool:approve_plan]"]
+  );
+  assert.equal(events.filter((event) => event.type === "turn_end").length, 3);
+});
+
+test("agent exposes tool-call continuation as an async iterable event stream", async () => {
+  const planner = new Planner();
+  planner.create({
+    objective: "Approve through event stream",
+    steps: [{ id: "done", title: "Finish" }]
+  });
+  planner.updateStep({ id: "done", status: "completed", appendEvidence: ["already complete"] });
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "approved and done"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    planning: { planner }
+  });
+
+  const events: AgentEvent[] = [];
+  for await (const event of agent.continueWithToolCallEvents({
+    id: "call_approve_stream",
+    name: APPROVE_PLAN_TOOL_NAME,
+    arguments: {}
+  })) {
+    events.push(event);
+  }
+
+  assert.deepEqual(
+    events.filter((event) => event.type === "agent_start").map((event) => event.input),
+    ["[tool:approve_plan]"]
+  );
+  assert.equal(events.some((event) => event.type === "tool_end" && event.result.toolName === APPROVE_PLAN_TOOL_NAME), true);
+  assert.equal(events.at(-1)?.type, "agent_end");
+  assert.equal(planner.state?.reviewStatus, "approved");
+  assert.equal(llm.requests[0]?.messages.at(-1)?.role, "tool");
+});
+
+test("planning guard prevents a final answer while plan steps remain open", async () => {
+  const planner = new Planner();
+  planner.create({
+    objective: "Complete work",
+    steps: [{ id: "work", title: "Do the work" }]
+  });
+  planner.approve({ note: "approved before execution" });
+  const events: AgentEvent[] = [];
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "done too early"
+    },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "call_complete",
+          name: UPDATE_PLAN_STEP_TOOL_NAME,
+          arguments: { id: "work", status: "completed", appendEvidence: ["verified work"] }
+        }
+      ]
+    },
+    {
+      role: "assistant",
+      content: "done after plan completion"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    planning: { planner },
+    onEvent(event) {
+      events.push(event);
+    }
+  });
+
+  const result = await agent.run("finish the plan", { maxTurns: 3 });
+
+  assert.equal(result.output, "done after plan completion");
+  assert.equal(result.stoppedBy, "final");
+  assert.equal(result.turns, 3);
+  assert.equal(planner.state?.steps[0]?.status, "completed");
+  const firstRequestLastMessage = llm.requests[1]?.messages.at(-1);
+  assert.equal(firstRequestLastMessage?.role, "tool");
+  if (firstRequestLastMessage?.role !== "tool") {
+    throw new Error("Expected plan guard tool result");
+  }
+  assert.match(firstRequestLastMessage.content, /cannot end while plan steps are pending or in_progress/);
+  const guardedAssistant = agent.history.find(
+    (message): message is AssistantMessage => message.role === "assistant" && message.content === "done too early"
+  );
+  assert.equal(guardedAssistant?.toolCalls?.[0]?.name, "read_plan");
+  assert.equal(events.filter((event) => event.type === "agent_end").length, 1);
+});
+
+test("planning guard allows final answers when all plan steps are closed", async () => {
+  const planner = new Planner();
+  planner.create({
+    objective: "Closed plan",
+    steps: [{ id: "done", title: "Done step" }]
+  });
+  planner.updateStep({ id: "done", status: "completed", appendEvidence: ["already verified"] });
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "finished"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    planning: { planner }
+  });
+
+  const result = await agent.run("report");
+
+  assert.equal(result.output, "finished");
+  assert.equal(result.stoppedBy, "final");
+  assert.equal(result.turns, 1);
+  assert.equal(llm.requests.length, 1);
+});
+
+test("planning disabled leaves mutation tools visible", async () => {
+  const llm = new SequenceLlm([{ role: "assistant", content: "ready" }]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    tools: [createShellTool()],
+    planning: false
+  });
+
+  await agent.run("hello");
+
+  assert.equal(llm.requests[0]?.tools?.some((tool) => tool.name === "execute_command"), true);
+  assert.doesNotMatch(llm.requests[0]?.systemPrompt ?? "", /Planning tools are available/);
 });
 
 test("agent adds conversation background to the system prompt when created", async () => {

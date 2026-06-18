@@ -37,7 +37,7 @@ export type PhaseSummaryConfig = {
 export type WritePhaseSummaryInput = PhaseSummaryConfig & {
   messages: readonly AgentMessage[];
   turns: number;
-  stoppedBy: "final" | "max_turns";
+  stoppedBy: "final" | "max_turns" | "plan_review";
   signal?: AbortSignal;
 };
 

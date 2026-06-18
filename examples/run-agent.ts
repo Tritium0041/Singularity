@@ -4,10 +4,12 @@ import { createInterface } from "node:readline/promises";
 import {
   Agent,
   AgentSessionStore,
+  APPROVE_PLAN_TOOL_NAME,
   createCoreTools,
   createLlmClientFromEnv,
   generateSessionTitle,
   MarkdownMemoryStore,
+  Planner,
   WorkspaceMemory,
   type AgentMessage,
   type ContextEngineOptions,
@@ -27,6 +29,7 @@ const DEFAULT_PROMPT = "Calculate (123 + 456) * 789, then tell me the result.";
 const CONFIG_PATH = ".agent-demo.json";
 const SESSION_DIR = ".agent-sessions";
 const DEFAULT_SESSION_TITLE = "Untitled session";
+const PLAN_DIRECTIVE = "#plan";
 
 type CliOptions = {
   help: boolean;
@@ -42,6 +45,15 @@ type StreamDisplayState = {
 };
 
 type SessionUsageSnapshot = AgentSessionUsageSnapshot;
+
+type RunUserPromptOptions = {
+  forcePlan?: boolean;
+  planDirectiveSource?: string;
+};
+
+type FinishAgentResultOptions = {
+  shouldNameSession?: boolean;
+};
 
 type DemoConfig = {
   provider?: string;
@@ -232,6 +244,7 @@ let displayState = createDisplayState();
 let usageLedger = new SessionUsageLedger();
 let exchangeCount = 0;
 let workspaceMemory = new WorkspaceMemory();
+let planner = new Planner();
 let activeSession: AgentSessionRecord | undefined;
 let sessions = new AgentSessionStore({ dir: SESSION_DIR });
 let sessionPersistenceEnabled = false;
@@ -273,6 +286,9 @@ function createDemoAgent(): Agent {
       store: createDemoMemoryStore(),
       maxMemoryResults: demoConfig.maxMemoryResults,
       phaseSummary: createDemoPhaseSummaryConfig()
+    },
+    planning: {
+      planner
     },
     history: activeSession?.messages,
     context: buildContextOptions(),
@@ -369,33 +385,79 @@ async function runTui(): Promise<void> {
   }
 }
 
-async function runUserPrompt(input: string): Promise<boolean> {
+async function runUserPrompt(input: string, options: RunUserPromptOptions = {}): Promise<boolean> {
   if (sessionPersistenceEnabled) {
     await ensureActiveSession();
   }
+  const planDirective = extractPlanDirective(input);
+  const forcePlan = options.forcePlan === true || planDirective.forcePlan;
+  const prompt = planDirective.input;
   const shouldNameSession = shouldGenerateSessionTitle(activeSession);
   exchangeCount += 1;
   displayState = createDisplayState();
   console.log(`\n[user ${exchangeCount}] ${input}`);
+  if (forcePlan) {
+    console.log(`[plan] forced by ${options.planDirectiveSource ?? (planDirective.forcePlan ? PLAN_DIRECTIVE : "command")}`);
+  }
 
   try {
-    const result = await agent.run(input, maxTurns === undefined ? {} : { maxTurns });
-    if (result.output && !displayState.runStreamedText) {
-      console.log(`\n${result.output}`);
-    } else {
-      finishStreamingLine();
-    }
-    if (result.stoppedBy === "max_turns") {
-      console.log(`[stop] reached maxTurns=${result.turns}`);
-    }
-    enqueueActiveSessionTitleAfterFirstRequest(shouldNameSession, result.messages);
-    await saveActiveSession();
+    const runOptions = {
+      ...(maxTurns === undefined ? {} : { maxTurns }),
+      ...(forcePlan ? { forcePlan: true } : {})
+    };
+    const result = await agent.run(prompt, runOptions);
+    await finishAgentResult(result, { shouldNameSession });
     return true;
   } catch (error) {
     finishStreamingLine();
     console.error(`[error] ${formatError(error)}`);
     return false;
   }
+}
+
+async function continueWithPlanApproval(note?: string): Promise<boolean> {
+  if (sessionPersistenceEnabled) {
+    await ensureActiveSession();
+  }
+  if (!planner.state) {
+    console.log("[plan] no active plan to approve");
+    return true;
+  }
+
+  displayState = createDisplayState();
+  console.log("[plan] approved; continuing");
+  try {
+    const result = await agent.continueWithToolCall(
+      {
+        id: `call_plan_approve_${Date.now().toString(36)}`,
+        name: APPROVE_PLAN_TOOL_NAME,
+        arguments: note ? { note } : {}
+      },
+      maxTurns === undefined ? {} : { maxTurns }
+    );
+    await finishAgentResult(result);
+    return true;
+  } catch (error) {
+    finishStreamingLine();
+    console.error(`[error] ${formatError(error)}`);
+    return false;
+  }
+}
+
+async function finishAgentResult(result: Awaited<ReturnType<Agent["run"]>>, options: FinishAgentResultOptions = {}): Promise<void> {
+  if (result.output && !displayState.runStreamedText) {
+    console.log(`\n${result.output}`);
+  } else {
+    finishStreamingLine();
+  }
+  if (result.stoppedBy === "max_turns") {
+    console.log(`[stop] reached maxTurns=${result.turns}`);
+  }
+  if (result.stoppedBy === "plan_review") {
+    console.log("[plan] waiting for user review. Use /plan approve to approve and continue, or reply with changes.");
+  }
+  enqueueActiveSessionTitleAfterFirstRequest(options.shouldNameSession === true, result.messages);
+  await saveActiveSession();
 }
 
 async function handleCommand(input: string): Promise<"exit" | "handled" | "message"> {
@@ -424,6 +486,10 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
   }
   if (input === "/memory" || input.startsWith("/memory ")) {
     await handleMemoryCommand(input);
+    return "handled";
+  }
+  if (input === "/plan" || input.startsWith("/plan ")) {
+    await handlePlanCommand(input);
     return "handled";
   }
   if (input === "/notes") {
@@ -492,6 +558,7 @@ function switchToSession(session: AgentSessionRecord): void {
   exchangeCount = session.exchangeCount;
   usageLedger = new SessionUsageLedger(session.usage);
   workspaceMemory = new WorkspaceMemory(session.workspace);
+  planner = new Planner(session.planning?.plan);
   agent = createDemoAgent();
 }
 
@@ -506,6 +573,9 @@ async function saveActiveSession(): Promise<void> {
       exchangeCount,
       messages: [...agent.history],
       workspace: workspaceMemory.state,
+      planning: {
+        plan: planner.state
+      },
       usage: usageLedger.snapshot()
     });
   });
@@ -790,8 +860,48 @@ function reloadRuntimeFromConfig(): void {
   usageLedger = new SessionUsageLedger();
   exchangeCount = 0;
   workspaceMemory = new WorkspaceMemory();
+  planner = new Planner();
   activeSession = undefined;
   agent = createDemoAgent();
+}
+
+async function handlePlanCommand(input: string): Promise<void> {
+  const [, subcommand = "show", ...args] = input.split(/\s+/);
+  const normalized = subcommand.toLowerCase();
+
+  if (normalized === "show" || normalized === "status") {
+    printPlanStatus();
+    return;
+  }
+
+  if (normalized === "json") {
+    console.log(JSON.stringify(planner.state ?? { plan: undefined }, null, 2));
+    return;
+  }
+
+  if (normalized === "approve" || normalized === "ok") {
+    await continueWithPlanApproval(args.join(" ").trim() || undefined);
+    return;
+  }
+
+  if (normalized === "run") {
+    const prompt = args.join(" ").trim();
+    if (!prompt) {
+      console.log("[plan] usage: /plan run <request>");
+      return;
+    }
+    await runUserPrompt(prompt, { forcePlan: true, planDirectiveSource: "/plan run" });
+    return;
+  }
+
+  if (normalized === "clear") {
+    planner.clear();
+    await saveActiveSession();
+    console.log("[plan] cleared");
+    return;
+  }
+
+  console.log("[plan] usage: /plan, /plan json, /plan approve [note], /plan run <request>, /plan clear");
 }
 
 async function handleMemoryCommand(input: string): Promise<void> {
@@ -860,10 +970,12 @@ function renderBanner(mode: "tui" | "one-shot"): void {
     console.log(`session=${activeSession ? `${activeSession.id} "${activeSession.title}"` : "(new on first message)"}`);
   }
   console.log(
-    `workspace_notes=${workspaceMemory.state.notes.length} memory_store=${demoConfig.memory ? createRequiredDemoMemoryStore().path : "off"} phase_memory=off`
+    `workspace_notes=${workspaceMemory.state.notes.length} plan=${formatPlanSummary()} memory_store=${
+      demoConfig.memory ? createRequiredDemoMemoryStore().path : "off"
+    } phase_memory=off`
   );
   if (mode === "tui") {
-    console.log("commands=/help /usage /sessions /session /config /memory /notes /compact /new /clear /exit");
+    console.log("commands=/help /usage /sessions /session /config /memory /plan /notes /compact /new /clear /exit");
   }
 }
 
@@ -872,6 +984,7 @@ function printUsage(): void {
   npm run demo
   npm run demo -- "Ask an initial question"
   npm run demo -- --once "Run one prompt and exit"
+  npm run demo -- "#plan Plan this request before executing"
 
 Environment:
   LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
@@ -883,7 +996,11 @@ Environment:
   AGENT_DYNAMIC_COMPRESSION=1
 
 Interactive commands:
-  /usage, /sessions, /session, /config, /memory, /notes, /compact, /new, /clear, /exit`);
+  /usage, /sessions, /session, /config, /memory, /plan, /notes, /compact, /new, /clear, /exit
+
+Plan mode:
+  Add #plan to any request, or use /plan run <request>, to force plan mode.
+  Use /plan approve after reviewing the plan to approve it and continue immediately.`);
 }
 
 function printTuiHelp(): void {
@@ -893,6 +1010,7 @@ function printTuiHelp(): void {
   /session show current session; subcommands: new/use/rename/delete
   /config show current config and change runtime settings
   /memory show, enable, or disable the long-term Markdown memory store
+  /plan   show current structured plan; subcommands: json/approve/run/clear
   /notes  show current workspace notes
   /forget-notes clear current workspace notes
   /compact manually summarize and compact the current conversation history
@@ -997,6 +1115,7 @@ function formatSessionStatus(): string {
     `compactions=${snapshot.compactions}`,
     `messages=${agent.history.length}`,
     `workspace_notes=${workspaceMemory.state.notes.length}`,
+    `plan=${formatPlanSummary()}`,
     `memory_store=${demoConfig.memory ? "on" : "off"}`,
     formatProviderUsage("provider_total", snapshot.providerUsage),
     `latest_${formatRequestContext(snapshot.latestContext)}`
@@ -1139,6 +1258,55 @@ function printMemoryStatus(): void {
   console.log(`[memory] workspace_notes=${workspaceMemory.state.notes.length}`);
   console.log(`[memory] long_term=${store ? "on" : "off"} store=${store?.path ?? "(disabled)"} maxResults=${demoConfig.maxMemoryResults ?? 5}`);
   console.log("[memory] phase_summary=paused store=(disabled)");
+}
+
+function printPlanStatus(): void {
+  const state = planner.state;
+  if (!state) {
+    console.log("[plan] none");
+    return;
+  }
+  console.log(`[plan] objective=${state.objective}`);
+  console.log(
+    `[plan] revision=${state.revision} review=${state.reviewStatus} current=${state.currentStepId ?? "(none)"} steps=${state.steps.length}`
+  );
+  if (state.reviewedAt) {
+    console.log(`[plan] reviewedAt=${state.reviewedAt}`);
+  }
+  for (const step of state.steps) {
+    const current = step.id === state.currentStepId ? " current" : "";
+    console.log(`[plan] ${step.id} status=${step.status}${current} title=${step.title}`);
+    if (step.evidence && step.evidence.length > 0) {
+      console.log(`[plan] ${step.id} evidence=${step.evidence.join(" | ")}`);
+    }
+  }
+}
+
+function formatPlanSummary(): string {
+  const state = planner.state;
+  if (!state) {
+    return "none";
+  }
+  const counts = new Map<string, number>();
+  for (const step of state.steps) {
+    counts.set(step.status, (counts.get(step.status) ?? 0) + 1);
+  }
+  const status = [...counts.entries()].map(([key, value]) => `${key}:${value}`).join(",");
+  return `rev${state.revision} review=${state.reviewStatus}${state.currentStepId ? ` current=${state.currentStepId}` : ""}${
+    status ? ` ${status}` : ""
+  }`;
+}
+
+function extractPlanDirective(input: string): { input: string; forcePlan: boolean } {
+  const pattern = /(^|\s)#plan(?=\s|$)/i;
+  if (!pattern.test(input)) {
+    return { input, forcePlan: false };
+  }
+  const normalized = input.replace(pattern, "$1").replace(/\s{2,}/g, " ").trim();
+  return {
+    input: normalized || input.trim(),
+    forcePlan: true
+  };
 }
 
 function printWorkspaceNotes(): void {

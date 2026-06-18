@@ -7,7 +7,8 @@ import type {
   AgentRunOptions,
   AgentRunResult,
   AssistantMessage,
-  ReasoningOptions
+  ReasoningOptions,
+  ToolCall
 } from "../types.js";
 import {
   applyDynamicCompressionWorkerResult,
@@ -36,6 +37,17 @@ import {
   type PhaseSummaryConfig,
   type WorkspaceState
 } from "../memory/index.js";
+import {
+  buildPlanningInstructions,
+  createPlanningTools,
+  formatPlanReviewRequest,
+  formatPlanSnapshot,
+  Planner,
+  CREATE_PLAN_TOOL_NAME,
+  READ_PLAN_TOOL_NAME,
+  hasOpenPlanSteps,
+  type PlanState
+} from "../planning/index.js";
 import { ToolExecutor, ToolRegistry, type AgentTool, type ToolExecutionMode } from "../tools/registry.js";
 
 const PHASE_SUMMARY_RUNTIME_ENABLED = false;
@@ -45,6 +57,15 @@ type PreparedAgentRequest = {
   historyReplacement?: AgentMessage[];
   registry: ToolRegistry;
   executor: ToolExecutor;
+};
+
+type RuntimePlanningMode = "normal" | "force";
+
+type RunLoopOptions = {
+  maxTurns: number;
+  options: AgentRunOptions;
+  planningMode: RuntimePlanningMode;
+  streamEventSink?: AgentEventSink;
 };
 
 export type AgentConfig = {
@@ -80,6 +101,15 @@ export type AgentConfig = {
               tags?: string[];
             };
       };
+  planning?:
+    | false
+    | {
+        planner?: Planner | PlanState;
+        includeInstructions?: boolean;
+        includeSnapshot?: boolean;
+        maxSteps?: number;
+        requirePlanBeforeMutation?: boolean;
+      };
   onEvent?: AgentEventSink;
 };
 
@@ -89,6 +119,14 @@ type ResolvedAgentMemory = {
   includeInstructions: boolean;
   maxMemoryResults: number;
   phaseSummary?: PhaseSummaryConfig;
+};
+
+type ResolvedAgentPlanning = {
+  planner: Planner;
+  includeInstructions: boolean;
+  includeSnapshot: boolean;
+  maxSteps: number;
+  requirePlanBeforeMutation: boolean;
 };
 
 export class Agent {
@@ -107,6 +145,7 @@ export class Agent {
   private readonly messages: AgentMessage[] = [];
   private readonly dynamicCompressionState: DynamicCompressionState;
   private readonly memory: ResolvedAgentMemory | undefined;
+  private readonly planning: ResolvedAgentPlanning | undefined;
   private readonly backgroundTasks = new Set<Promise<void>>();
   private phaseSummaryQueue: Promise<void> = Promise.resolve();
 
@@ -124,6 +163,7 @@ export class Agent {
     this.tools = config.tools instanceof ToolRegistry ? config.tools : new ToolRegistry(config.tools ?? []);
     this.dynamicCompressionState = getInitialDynamicCompressionState(config.context);
     this.memory = this.resolveMemoryConfig(config.memory);
+    this.planning = this.resolvePlanningConfig(config.planning);
     this.messages.push(...(config.history ?? []).map(cloneAgentMessage));
     this.systemPrompt = this.buildSystemPrompt(config);
   }
@@ -134,6 +174,10 @@ export class Agent {
 
   async run(input: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
     return this.runInternal(input, options);
+  }
+
+  async continueWithToolCall(toolCall: ToolCall, options: AgentRunOptions = {}): Promise<AgentRunResult> {
+    return this.continueWithToolCallInternal(toolCall, options);
   }
 
   async compactHistory(options: AgentCompactOptions = {}): Promise<AgentCompactResult> {
@@ -195,6 +239,24 @@ export class Agent {
     }
   }
 
+  async *continueWithToolCallEvents(toolCall: ToolCall, options: AgentRunOptions = {}): AsyncIterable<AgentEvent> {
+    const events = new AsyncEventQueue<AgentEvent>();
+    const runPromise = this.continueWithToolCallInternal(toolCall, options, (event) => {
+      events.push(event);
+    }).then(
+      () => events.close(),
+      (error: unknown) => events.fail(error)
+    );
+
+    try {
+      for await (const event of events) {
+        yield event;
+      }
+    } finally {
+      await runPromise;
+    }
+  }
+
   private async runInternal(
     input: string,
     options: AgentRunOptions = {},
@@ -203,10 +265,44 @@ export class Agent {
     const maxTurns = options.maxTurns ?? this.maxTurns;
     const userMessage: AgentMessage = { role: "user", content: input };
     this.messages.push(userMessage);
+    const planningMode: RuntimePlanningMode = options.forcePlan ? "force" : "normal";
 
     await this.emit({ type: "agent_start", input }, streamEventSink);
     await this.emit({ type: "message", message: userMessage }, streamEventSink);
 
+    return this.runLoop({ maxTurns, options, planningMode, streamEventSink });
+  }
+
+  private async continueWithToolCallInternal(
+    toolCall: ToolCall,
+    options: AgentRunOptions = {},
+    streamEventSink?: AgentEventSink
+  ): Promise<AgentRunResult> {
+    const maxTurns = options.maxTurns ?? this.maxTurns;
+    const planningMode: RuntimePlanningMode = options.forcePlan ? "force" : "normal";
+
+    await this.emit({ type: "agent_start", input: `[tool:${toolCall.name}]` }, streamEventSink);
+
+    const contextOptions = this.resolveContextOptions(options.context);
+    const registry = this.buildRuntimeToolRegistry(contextOptions);
+    const executor = new ToolExecutor(registry);
+    const assistant: AssistantMessage = {
+      role: "assistant",
+      content: "",
+      toolCalls: [toolCall]
+    };
+    this.messages.push(assistant);
+    await this.emit({ type: "message", message: assistant }, streamEventSink);
+    await this.emit({ type: "tool_start", turn: 0, toolCall }, streamEventSink);
+    const toolResult = await executor.execute(toolCall, options.signal);
+    this.messages.push(toolResult);
+    await this.emit({ type: "tool_end", turn: 0, toolCall, result: toolResult }, streamEventSink);
+    await this.emit({ type: "message", message: toolResult }, streamEventSink);
+
+    return this.runLoop({ maxTurns, options, planningMode, streamEventSink });
+  }
+
+  private async runLoop({ maxTurns, options, planningMode, streamEventSink }: RunLoopOptions): Promise<AgentRunResult> {
     let lastAssistant: AssistantMessage | undefined;
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
@@ -220,18 +316,36 @@ export class Agent {
         reasoning: options.reasoning ?? this.reasoning,
         signal: options.signal
       };
-      const prepared = await this.prepareRequest(rawRequest, options.context);
+      const prepared = await this.prepareRequest(rawRequest, options.context, planningMode);
       const request = prepared.request;
       if (prepared.historyReplacement) {
         this.messages.splice(0, this.messages.length, ...prepared.historyReplacement);
       }
       const assistant = this.withRequestContext(await this.completeAssistant(turn, request, streamEventSink), request);
-      lastAssistant = assistant;
-      this.messages.push(assistant);
-      await this.emit({ type: "message", message: assistant }, streamEventSink);
-
       const toolCalls = assistant.toolCalls ?? [];
       if (toolCalls.length === 0) {
+        const planGuardResult = this.buildPlanGuardResult();
+        if (planGuardResult) {
+          const guardedAssistant = this.withSyntheticToolCall(assistant, planGuardResult.toolCall);
+          lastAssistant = guardedAssistant;
+          this.messages.push(guardedAssistant);
+          await this.emit({ type: "message", message: guardedAssistant }, streamEventSink);
+          await this.emit({ type: "tool_start", turn, toolCall: planGuardResult.toolCall }, streamEventSink);
+          this.messages.push(planGuardResult.toolResult);
+          await this.emit({ type: "tool_end", turn, toolCall: planGuardResult.toolCall, result: planGuardResult.toolResult }, streamEventSink);
+          await this.emit({ type: "message", message: planGuardResult.toolResult }, streamEventSink);
+          await this.emit({
+            type: "turn_end",
+            turn,
+            message: guardedAssistant,
+            toolResults: [planGuardResult.toolResult],
+            context: request.metadata?.context
+          }, streamEventSink);
+          continue;
+        }
+        lastAssistant = assistant;
+        this.messages.push(assistant);
+        await this.emit({ type: "message", message: assistant }, streamEventSink);
         const result = this.buildResult(assistant.content, turn, "final");
         await this.emit({ type: "turn_end", turn, message: assistant, toolResults: [], context: request.metadata?.context }, streamEventSink);
         await this.emit({ type: "agent_end", result }, streamEventSink);
@@ -239,6 +353,9 @@ export class Agent {
         return result;
       }
 
+      lastAssistant = assistant;
+      this.messages.push(assistant);
+      await this.emit({ type: "message", message: assistant }, streamEventSink);
       const toolResults = await this.executeToolCalls(turn, toolCalls, prepared.registry, prepared.executor, options.signal, streamEventSink);
 
       this.messages.push(...toolResults);
@@ -246,6 +363,15 @@ export class Agent {
         await this.emit({ type: "message", message }, streamEventSink);
       }
       await this.emit({ type: "turn_end", turn, message: assistant, toolResults, context: request.metadata?.context }, streamEventSink);
+
+      const reviewResult = this.buildPlanReviewResult();
+      if (reviewResult) {
+        this.messages.push(reviewResult.message);
+        await this.emit({ type: "message", message: reviewResult.message }, streamEventSink);
+        const result = this.buildResult(reviewResult.message.content, turn, "plan_review");
+        await this.emit({ type: "agent_end", result }, streamEventSink);
+        return result;
+      }
     }
 
     const result = this.buildResult(lastAssistant?.content ?? "", maxTurns, "max_turns");
@@ -313,13 +439,16 @@ export class Agent {
 
   private async prepareRequest(
     request: LlmRequest,
-    runContext?: false | Partial<ContextEngineOptions>
+    runContext?: false | Partial<ContextEngineOptions>,
+    planningMode: RuntimePlanningMode = "normal"
   ): Promise<PreparedAgentRequest> {
     const contextOptions = this.resolveContextOptions(runContext);
     const registry = this.buildRuntimeToolRegistry(contextOptions);
     const executor = new ToolExecutor(registry);
+    const systemPrompt = this.withRuntimePlanningMode(this.withDynamicPlanningSnapshot(request.systemPrompt), planningMode);
     const requestWithRuntimeTools: LlmRequest = {
       ...request,
+      systemPrompt,
       tools: registry.toLlmToolSpecs()
     };
     if (contextOptions === false) {
@@ -377,7 +506,11 @@ export class Agent {
         tools.push(...createMemoryStoreTools(this.memory.store, { maxMemoryResults: this.memory.maxMemoryResults }));
       }
     }
-    return new ToolRegistry(tools);
+    if (this.planning) {
+      tools.push(...createPlanningTools(this.planning.planner));
+    }
+    const visibleTools = this.shouldGatePrePlanTools() ? tools.filter((tool) => isAllowedBeforePlan(tool, this.planning?.planner.state)) : tools;
+    return new ToolRegistry(visibleTools);
   }
 
   private buildSystemPrompt(config: AgentConfig): string | undefined {
@@ -392,16 +525,21 @@ export class Agent {
 
   private buildStaticPromptFragments(config: AgentConfig): PromptFragment[] {
     const fragments = [...(config.promptFragments ?? [])];
-    if (config.background === false || !this.memory?.includeInstructions) {
+    if (config.background === false) {
       return fragments;
     }
 
-    const memoryInstructions = buildMemoryInstructions({
-      hasWorkspace: true,
-      hasStore: Boolean(this.memory.store)
-    });
-    if (memoryInstructions) {
-      fragments.push(memoryInstructions);
+    if (this.memory?.includeInstructions) {
+      const memoryInstructions = buildMemoryInstructions({
+        hasWorkspace: true,
+        hasStore: Boolean(this.memory.store)
+      });
+      if (memoryInstructions) {
+        fragments.push(memoryInstructions);
+      }
+    }
+    if (this.planning?.includeInstructions) {
+      fragments.push(buildPlanningInstructions({ requirePlanBeforeMutation: this.planning.requirePlanBeforeMutation }));
     }
     return fragments;
   }
@@ -442,6 +580,60 @@ export class Agent {
       prompt: config.prompt,
       tags: [PHASE_SUMMARY_TAG, ...(config.tags ?? [])]
     };
+  }
+
+  private resolvePlanningConfig(config: AgentConfig["planning"]): ResolvedAgentPlanning | undefined {
+    if (config === false || config === undefined) {
+      return undefined;
+    }
+
+    const planningConfig = config;
+    return {
+      planner: resolvePlanner(planningConfig.planner),
+      includeInstructions: planningConfig.includeInstructions ?? true,
+      includeSnapshot: planningConfig.includeSnapshot ?? true,
+      maxSteps: clampPlanSnapshotSteps(planningConfig.maxSteps ?? 20),
+      requirePlanBeforeMutation: planningConfig.requirePlanBeforeMutation ?? true
+    };
+  }
+
+  private shouldGatePrePlanTools(): boolean {
+    if (!this.planning?.requirePlanBeforeMutation) {
+      return false;
+    }
+    const plan = this.planning.planner.state;
+    return !plan || plan.reviewStatus !== "approved";
+  }
+
+  private withDynamicPlanningSnapshot(systemPrompt: string | undefined): string | undefined {
+    if (!this.planning?.includeSnapshot) {
+      return systemPrompt;
+    }
+    const snapshot = formatPlanSnapshot(this.planning.planner.state, { maxSteps: this.planning.maxSteps });
+    if (!snapshot) {
+      return systemPrompt;
+    }
+    if (!systemPrompt || systemPrompt.trim() === "") {
+      return snapshot;
+    }
+    return `${systemPrompt}\n\n${snapshot}`;
+  }
+
+  private withRuntimePlanningMode(systemPrompt: string | undefined, planningMode: RuntimePlanningMode): string | undefined {
+    if (!this.planning || planningMode !== "force") {
+      return systemPrompt;
+    }
+    const directive = [
+      "<runtime_plan_mode forced=\"true\">",
+      "The user explicitly requested plan mode for this turn.",
+      "You must create or revise the structured plan before execution, then present the plan to the user for review.",
+      "Do not perform write, execute, or other mutation work until the plan is approved.",
+      "</runtime_plan_mode>"
+    ].join("\n");
+    if (!systemPrompt || systemPrompt.trim() === "") {
+      return directive;
+    }
+    return `${systemPrompt}\n\n${directive}`;
   }
 
   private buildBackgroundOptions(background: AgentConfig["background"]): false | SystemPromptBackgroundOptions {
@@ -502,7 +694,62 @@ export class Agent {
       output,
       messages: [...this.messages],
       turns,
-      stoppedBy
+      stoppedBy,
+      plan: this.planning?.planner.state
+    };
+  }
+
+  private buildPlanGuardResult():
+    | { toolCall: NonNullable<AssistantMessage["toolCalls"]>[number]; toolResult: AgentMessage & { role: "tool" } }
+    | undefined {
+    const plan = this.planning?.planner.state;
+    if (!plan) {
+      return undefined;
+    }
+
+    if (plan.reviewStatus !== "approved" || !hasOpenPlanSteps(plan)) {
+      return undefined;
+    }
+
+    const openSteps = plan.steps.filter((step) => step.status === "pending" || step.status === "in_progress");
+    const toolCall = {
+      id: `plan_guard_${this.messages.length + 1}_${plan.revision}_${openSteps.length}`,
+      name: READ_PLAN_TOOL_NAME,
+      arguments: {}
+    };
+    return {
+      toolCall,
+      toolResult: {
+        role: "tool",
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        content: [
+          "Plan mode guard: the conversation cannot end while plan steps are pending or in_progress.",
+          "Continue the task, or update the plan by completing, blocking, cancelling, or revising the open steps before the final answer.",
+          formatPlanSnapshot(plan, { maxSteps: this.planning?.maxSteps })
+        ].filter((line): line is string => Boolean(line)).join("\n\n"),
+        details: { plan }
+      }
+    };
+  }
+
+  private buildPlanReviewResult(): { message: AssistantMessage } | undefined {
+    const plan = this.planning?.planner.state;
+    if (!plan || plan.reviewStatus !== "pending") {
+      return undefined;
+    }
+
+    const message: AssistantMessage = {
+      role: "assistant",
+      content: formatPlanReviewRequest(plan, { maxSteps: this.planning?.maxSteps })
+    };
+    return { message };
+  }
+
+  private withSyntheticToolCall(assistant: AssistantMessage, toolCall: NonNullable<AssistantMessage["toolCalls"]>[number]): AssistantMessage {
+    return {
+      ...assistant,
+      toolCalls: [...(assistant.toolCalls ?? []), toolCall]
     };
   }
 
@@ -753,11 +1000,38 @@ function resolveMemoryStore(store: MarkdownMemoryStore | { path?: string } | und
   return new MarkdownMemoryStore(store);
 }
 
+function resolvePlanner(planner: Planner | PlanState | undefined): Planner {
+  if (planner instanceof Planner) {
+    return planner;
+  }
+  return new Planner(planner);
+}
+
 function clampMemoryResults(value: number): number {
   if (!Number.isFinite(value)) {
     return 5;
   }
   return Math.min(20, Math.max(1, Math.floor(value)));
+}
+
+function clampPlanSnapshotSteps(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 20;
+  }
+  return Math.min(100, Math.max(1, Math.floor(value)));
+}
+
+function isAllowedBeforePlan(tool: AgentTool, plan: PlanState | undefined): boolean {
+  if (tool.access === "read") {
+    return true;
+  }
+  if (tool.access !== "planner") {
+    return false;
+  }
+  if (!plan) {
+    return tool.name === CREATE_PLAN_TOOL_NAME || tool.name === READ_PLAN_TOOL_NAME;
+  }
+  return true;
 }
 
 function cloneAgentMessage(message: AgentMessage): AgentMessage {

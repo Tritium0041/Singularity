@@ -22,8 +22,8 @@ export type TruncatedText = {
   details: TruncationDetails;
 };
 
-export const DEFAULT_MAX_LINES = 2000;
-export const DEFAULT_MAX_BYTES = 50 * 1024;
+export const DEFAULT_MAX_LINES = 10_000;
+export const DEFAULT_MAX_BYTES = 80 * 1024;
 
 export function truncateHead(text: string, options: TruncationOptions = {}): TruncatedText {
   return truncate(text, "head", options);
@@ -100,6 +100,12 @@ function takeFromHead(lines: string[], maxLines: number, maxBytes: number): { li
     const lineBytes = Buffer.byteLength(line, "utf8") + (output.length > 0 ? 1 : 0);
     if (bytes + lineBytes > maxBytes) {
       truncatedBy = "bytes";
+      if (output.length === 0 && maxLines > 0) {
+        const clipped = sliceUtf8ByBytes(line, maxBytes, "head");
+        if (clipped) {
+          output.push(clipped);
+        }
+      }
       break;
     }
     output.push(line);
@@ -123,6 +129,12 @@ function takeFromTail(lines: string[], maxLines: number, maxBytes: number): { li
     const lineBytes = Buffer.byteLength(line, "utf8") + (output.length > 0 ? 1 : 0);
     if (bytes + lineBytes > maxBytes) {
       truncatedBy = "bytes";
+      if (output.length === 0 && maxLines > 0) {
+        const clipped = sliceUtf8ByBytes(line, maxBytes, "tail");
+        if (clipped) {
+          output.unshift(clipped);
+        }
+      }
       break;
     }
     output.unshift(line);
@@ -130,6 +142,40 @@ function takeFromTail(lines: string[], maxLines: number, maxBytes: number): { li
   }
 
   return { lines: output, truncatedBy };
+}
+
+function sliceUtf8ByBytes(text: string, maxBytes: number, direction: TruncationDirection): string {
+  if (maxBytes <= 0) {
+    return "";
+  }
+
+  const characters = Array.from(text);
+  if (direction === "head") {
+    let bytes = 0;
+    const output: string[] = [];
+    for (const character of characters) {
+      const characterBytes = Buffer.byteLength(character, "utf8");
+      if (bytes + characterBytes > maxBytes) {
+        break;
+      }
+      output.push(character);
+      bytes += characterBytes;
+    }
+    return output.join("");
+  }
+
+  let bytes = 0;
+  const output: string[] = [];
+  for (let index = characters.length - 1; index >= 0; index -= 1) {
+    const character = characters[index] ?? "";
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) {
+      break;
+    }
+    output.unshift(character);
+    bytes += characterBytes;
+  }
+  return output.join("");
 }
 
 function splitLines(text: string): string[] {

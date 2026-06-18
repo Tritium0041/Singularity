@@ -45,6 +45,25 @@ test("session store creates, lists, saves, loads, and renames sessions", async (
           }
         ]
       },
+      planning: {
+        plan: {
+          objective: "Persist planner",
+          reviewStatus: "pending",
+          revision: 1,
+          createdAt: "2026-06-18T00:00:00.000Z",
+          updatedAt: "2026-06-18T00:00:00.000Z",
+          currentStepId: "inspect",
+          steps: [
+            {
+              id: "inspect",
+              title: "Inspect files",
+              status: "pending",
+              createdAt: "2026-06-18T00:00:00.000Z",
+              updatedAt: "2026-06-18T00:00:00.000Z"
+            }
+          ]
+        }
+      },
       usage: {
         assistantTurns: 1,
         compactions: 0,
@@ -64,6 +83,8 @@ test("session store creates, lists, saves, loads, and renames sessions", async (
     const loaded = await store.loadSession(session.id);
     assert.deepEqual(loaded.messages, saved.messages);
     assert.deepEqual(loaded.workspace, saved.workspace);
+    assert.equal(loaded.planning?.plan?.objective, "Persist planner");
+    assert.equal(loaded.planning?.plan?.steps[0]?.id, "inspect");
     assert.equal(loaded.usage.providerUsage?.inputTokens, 4);
     assert.equal(loaded.usage.providerUsage?.outputTokens, 2);
     assert.equal(loaded.usage.providerUsage?.totalTokens, 6);
@@ -75,6 +96,59 @@ test("session store creates, lists, saves, loads, and renames sessions", async (
     const raw = JSON.parse(await readFile(store.sessionPath(session.id), "utf8")) as AgentSessionRecord;
     assert.equal(raw.schemaVersion, 1);
     assert.equal(raw.id, session.id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("session store loads older sessions without planning state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "singularity-sessions-"));
+  try {
+    const store = new AgentSessionStore({ dir });
+    const session = await store.createSession({ title: "Old" });
+    const legacy: Record<string, unknown> = { ...session };
+    delete legacy.planning;
+    await writeFile(store.sessionPath(session.id), JSON.stringify(legacy), "utf8");
+
+    const loaded = await store.loadSession(session.id);
+    assert.equal(loaded.planning, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("session store validates malformed planning state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "singularity-sessions-"));
+  try {
+    const store = new AgentSessionStore({ dir });
+    const session = await store.createSession({ title: "Invalid plan" });
+    await writeFile(
+      store.sessionPath(session.id),
+      JSON.stringify({
+        ...session,
+        planning: {
+          plan: {
+            objective: "Bad",
+            revision: 1,
+            createdAt: "2026-06-18T00:00:00.000Z",
+            updatedAt: "2026-06-18T00:00:00.000Z",
+            currentStepId: "done",
+            steps: [
+              {
+                id: "done",
+                title: "Done",
+                status: "completed",
+                createdAt: "2026-06-18T00:00:00.000Z",
+                updatedAt: "2026-06-18T00:00:00.000Z"
+              }
+            ]
+          }
+        }
+      }),
+      "utf8"
+    );
+
+    await assert.rejects(() => store.loadSession(session.id), /evidence/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

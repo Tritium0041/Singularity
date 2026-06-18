@@ -343,12 +343,48 @@ test("list_directory returns structured limited entries", async () => {
     const listTool = findTool(createFileSystemTools({ rootDir: root }), "list_directory");
 
     const result = await listTool.execute({ path: ".", limit: 1 }, { toolCallId: "call_1" });
-    const body = JSON.parse(result.content) as { entries: Array<{ name: string; type: string; size: number }>; entryLimitReached: boolean };
+    const details = result.details as {
+      entries: Array<{ name: string; type: string; size: number }>;
+      entryLimitReached: boolean;
+      nextOffset?: number;
+    };
 
-    assert.equal(body.entries.length, 1);
-    assert.equal(body.entries[0]?.name, "a.txt");
-    assert.equal(body.entries[0]?.type, "file");
-    assert.equal(body.entryLimitReached, true);
+    assert.match(result.content, /^Directory: /);
+    assert.match(result.content, /Entries: 1 shown \(1-1\) of 2; offset=0 limit=1/);
+    assert.match(result.content, /file\t1\ta\.txt/);
+    assert.match(result.content, /Re-run list_directory with offset=1 limit=1/);
+    assert.equal(details.entries.length, 1);
+    assert.equal(details.entries[0]?.name, "a.txt");
+    assert.equal(details.entries[0]?.type, "file");
+    assert.equal(details.entryLimitReached, true);
+    assert.equal(details.nextOffset, 1);
+
+    const second = await listTool.execute({ path: ".", offset: 1, limit: 1 }, { toolCallId: "call_2" });
+    const secondDetails = second.details as { entries: Array<{ name: string }>; entryLimitReached: boolean; nextOffset?: number };
+    assert.match(second.content, /file\t2\tb\.txt/);
+    assert.equal(secondDetails.entries[0]?.name, "b.txt");
+    assert.equal(secondDetails.entryLimitReached, false);
+    assert.equal(secondDetails.nextOffset, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("list_directory large output stays compact and continuable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-list-large-"));
+  try {
+    for (let index = 0; index < 120; index += 1) {
+      await writeFile(join(root, `file_${String(index).padStart(3, "0")}_${"long_".repeat(8)}.txt`), "x", "utf8");
+    }
+    const listTool = findTool(createFileSystemTools({ rootDir: root, maxBytes: 2048 }), "list_directory");
+
+    const result = await listTool.execute({ path: ".", limit: 100 }, { toolCallId: "call_1" });
+
+    assert.doesNotMatch(result.content, /^\{/);
+    assert.match(result.content, /Directory: /);
+    assert.match(result.content, /Entries: 100 shown \(1-100\) of 120; offset=0 limit=100/);
+    assert.match(result.content, /offset=100 limit=100/);
+    assert.ok(Buffer.byteLength(result.content, "utf8") <= 4096);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -377,6 +413,24 @@ test("execute_command captures stderr, nonzero exit, and timeout", async () => {
   }
 });
 
+test("execute_command default budget does not truncate medium source output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-shell-medium-"));
+  try {
+    const content = Array.from({ length: 1200 }, (_, index) => `line-${index} ${"source ".repeat(6)}`).join("\n");
+    await writeFile(join(root, "medium.txt"), content, "utf8");
+    const shellTool = createShellTool({ rootDir: root });
+
+    const result = await shellTool.execute({ command: "cat medium.txt", workdir: "." }, { toolCallId: "call_1" });
+
+    assert.doesNotMatch(result.content, /Truncated command output/);
+    assert.match(result.content, /line-0/);
+    assert.match(result.content, /line-1199/);
+    assert.equal((result.details as { truncation: { truncated: boolean } }).truncation.truncated, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("fetch_url extracts HTML text and web_search reports missing Tavily key", async () => {
   const fetchImpl: typeof fetch = async () =>
     new Response("<html><head><title>Hello</title><script>bad()</script></head><body><main>Useful text</main></body></html>", {
@@ -394,6 +448,61 @@ test("fetch_url extracts HTML text and web_search reports missing Tavily key", a
   assert.match(fetched.content, /Title: Hello/);
   assert.match(fetched.content, /Useful text/);
   assert.doesNotMatch(fetched.content, /bad\(\)/);
+});
+
+test("web_search returns compact bounded text with full details", async () => {
+  const longSnippet = `Lead ${"snippet ".repeat(200)}`;
+  const fetchImpl: typeof fetch = async () =>
+    Response.json({
+      results: [
+        { title: "First result", url: "https://example.com/one", content: longSnippet, score: 0.9 },
+        { title: "Second result", url: "https://example.com/two", content: "short", score: 0.8 }
+      ]
+    });
+  const searchTool = findTool(createWebTools({ apiKey: "test-key", fetchImpl }), "web_search");
+
+  const result = await searchTool.execute({ query: "typescript", maxResults: 2 }, { toolCallId: "call_1" });
+  const details = result.details as { results: Array<{ snippet: string }> };
+
+  assert.match(result.content, /^Search: typescript/);
+  assert.match(result.content, /Results: 2/);
+  assert.match(result.content, /1\. First result/);
+  assert.match(result.content, /URL: https:\/\/example\.com\/one/);
+  assert.match(result.content, /\[snippet truncated\]/);
+  assert.ok(result.content.length < 2000);
+  assert.equal(details.results[0]?.snippet, longSnippet);
+});
+
+test("truncation keeps useful content for single long lines", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-long-line-"));
+  try {
+    await writeFile(join(root, "long.txt"), "A".repeat(4096), "utf8");
+    const readTool = findTool(createFileSystemTools({ rootDir: root, maxBytes: 128 }), "read_file");
+
+    const result = await readTool.execute({ path: "long.txt" }, { toolCallId: "call_1" });
+
+    assert.match(result.content, /^A+/);
+    assert.match(result.content, /Use offset=2 to continue/);
+    assert.ok((result.details as { truncation: { outputBytes: number } }).truncation.outputBytes > 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fetch_url preserves paragraph text before truncation marker", async () => {
+  const html = `<html><head><title>Long page</title></head><body>${Array.from(
+    { length: 40 },
+    (_, index) => `<p>paragraph-${index} ${"body ".repeat(20)}</p>`
+  ).join("")}</body></html>`;
+  const fetchImpl: typeof fetch = async () => new Response(html, { headers: { "content-type": "text/html" } });
+  const fetchTool = findTool(createWebTools({ apiKey: "test-key", fetchImpl, maxBytes: 512 }), "fetch_url");
+
+  const result = await fetchTool.execute({ url: "https://example.com/long" }, { toolCallId: "call_1" });
+
+  assert.match(result.content, /Title: Long page/);
+  assert.match(result.content, /paragraph-0/);
+  assert.match(result.content, /paragraph-1/);
+  assert.match(result.content, /Truncated fetched content/);
 });
 
 test("agent can run a long file-search-fetch-write tool chain with fake streaming LLM", async () => {
