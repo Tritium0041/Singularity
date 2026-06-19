@@ -13,6 +13,8 @@ Singularity is a minimal TypeScript agent runtime for experimenting with LLM too
 - Tool output truncation for large file, command, and URL results.
 - Context budgeting uses provider-reported token usage when available, can dynamically summarize stale history in the request view, and still falls back to one-shot no-tool handoff compaction for oversized histories.
 - Memory System v1 with current-task Workspace notes, an optional Markdown memory store, and tool-only memory retrieval.
+- Skill discovery with progressive disclosure from local `SKILL.md` files.
+- MCP stdio tool integration through the official Model Context Protocol SDK.
 
 ## Requirements
 
@@ -61,6 +63,7 @@ Interactive commands:
 - `/config`: show or change demo settings without restarting with new environment variables.
 - `/memory`: show, enable, or disable the long-term Markdown memory store.
 - `/plan`: show, approve, run, or clear the current structured plan.
+- `/skill`: list loaded skills; `/skill:<name> [args]` explicitly loads one skill for the next run.
 - `/notes`: show current Workspace notes.
 - `/forget-notes`: clear current Workspace notes.
 - `/compact`: manually summarize and compact the current conversation history.
@@ -105,6 +108,8 @@ The TUI config command stores overrides in local `.agent-demo.json`, which is ig
 /config set toolset all
 /config set maxTurns 12
 /config set tavilyApiKey tvly-dev-...
+/config set skillPaths .singularity/skills,/tmp/agent-skills
+/config set mcpConfigPath .singularity/mcp.json
 /config set dynamicCompression true
 /config set dynamicAutoSummarize false
 /config set compressionModel gpt-4.1-mini
@@ -151,6 +156,61 @@ Optional environment variables:
 - `AGENT_TOOLSET`: `basic`, `files`, `shell`, `web`, or `all`. Defaults to `basic`.
 - `AGENT_MAX_TURNS`: positive integer overriding the demo run's max turn count. The agent default is `8`.
 - `TAVILY_API_KEY`: required by the `web_search` tool unless `tavilyApiKey` is set through `/config`.
+
+## Skills
+
+Skills are Markdown workflow instructions discovered from `.singularity/skills` by default, or from paths passed to `skills.roots`. A directory with `SKILL.md` is treated as one skill; root-level `.md` files are also supported. Only the skill name, description, and location are injected into the system prompt, and only when `read_file` is available.
+
+```md
+---
+name: repo-review
+description: Review a repository change for bugs and missing tests.
+---
+
+Read the diff, prioritize concrete risks, and report findings first.
+```
+
+```ts
+const agent = new Agent({
+  llm: llm.llm,
+  model: llm.model,
+  tools: createCoreTools({ toolset: "files" }),
+  skills: { roots: [".singularity/skills"] }
+});
+```
+
+Set `disable-model-invocation: true` in frontmatter to hide a skill from implicit model selection while still allowing explicit demo invocation with `/skill:<name>`.
+
+## MCP
+
+MCP v1 supports stdio servers. Start a manager, pass it to the agent, and its tools are exposed through the normal tool registry.
+
+```json
+{
+  "servers": {
+    "docs": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["./mcp-docs-server.js"],
+      "enabledTools": ["search_docs"]
+    }
+  }
+}
+```
+
+```ts
+const mcp = new McpManager({ config: mcpConfig });
+await mcp.start();
+
+const agent = new Agent({
+  llm: llm.llm,
+  model: llm.model,
+  tools: createCoreTools({ toolset: "basic" }),
+  mcp
+});
+```
+
+MCP tools are named `mcp_<server>_<tool>` after normalization. v1 does not include HTTP transport, OAuth, resources, deferred tools, or a separate approval UI.
 
 OpenAI-compatible local or third-party providers can use the Chat Completions adapter:
 

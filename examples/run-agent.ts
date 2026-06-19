@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import {
@@ -6,9 +7,12 @@ import {
   AgentSessionStore,
   APPROVE_PLAN_TOOL_NAME,
   createCoreTools,
+  formatSkillInvocation,
   createLlmClientFromEnv,
   generateSessionTitle,
+  loadSkillsSync,
   MarkdownMemoryStore,
+  McpManager,
   Planner,
   WorkspaceMemory,
   type AgentMessage,
@@ -19,9 +23,11 @@ import {
   type ContextCompactionMetadata,
   type CoreToolset,
   type EnvLlmClient,
+  type McpConfig,
   type ReasoningEffort,
   type RequestContextMetadata,
   type RequestTokenEstimateMetadata,
+  type SkillLoadResult,
   type TokenUsage
 } from "../src/index.js";
 
@@ -87,6 +93,8 @@ type DemoConfig = {
   memoryPath?: string;
   maxMemoryResults?: number;
   phaseSummary?: boolean;
+  skillPaths?: string;
+  mcpConfigPath?: string;
 };
 
 type DemoConfigKey = keyof DemoConfig;
@@ -122,7 +130,9 @@ const CONFIG_KEY_HELP: Record<DemoConfigKey, string> = {
   memory: "true/false enable long-term Markdown memory store",
   memoryPath: "path for long-term Markdown memory store",
   maxMemoryResults: "positive integer default search_memory result count",
-  phaseSummary: "reserved; phase-summary memory is currently paused"
+  phaseSummary: "reserved; phase-summary memory is currently paused",
+  skillPaths: "comma-separated skill roots; defaults to .singularity/skills",
+  mcpConfigPath: "path to a JSON MCP config file"
 };
 
 class SessionUsageLedger {
@@ -245,6 +255,8 @@ let usageLedger = new SessionUsageLedger();
 let exchangeCount = 0;
 let workspaceMemory = new WorkspaceMemory();
 let planner = new Planner();
+let loadedSkills = loadDemoSkills();
+let mcpManager: McpManager | undefined = await createDemoMcpManager();
 let activeSession: AgentSessionRecord | undefined;
 let sessions = new AgentSessionStore({ dir: SESSION_DIR });
 let sessionPersistenceEnabled = false;
@@ -255,6 +267,7 @@ const demoBackgroundTasks = new Set<Promise<void>>();
 if (cli.once || !stdin.isTTY) {
   renderBanner("one-shot");
   const ok = await runUserPrompt(cli.prompt ?? DEFAULT_PROMPT);
+  await agent.close();
   if (!ok) {
     process.exitCode = 1;
   }
@@ -281,6 +294,8 @@ function createDemoAgent(): Agent {
       toolset,
       web: { apiKey: demoConfig.tavilyApiKey }
     }),
+    skills: loadedSkills,
+    mcp: mcpManager,
     memory: {
       workspace: workspaceMemory,
       store: createDemoMemoryStore(),
@@ -381,6 +396,7 @@ async function runTui(): Promise<void> {
       await runUserPrompt(input);
     }
   } finally {
+    await agent.close();
     rl.close();
   }
 }
@@ -490,6 +506,10 @@ async function handleCommand(input: string): Promise<"exit" | "handled" | "messa
   }
   if (input === "/plan" || input.startsWith("/plan ")) {
     await handlePlanCommand(input);
+    return "handled";
+  }
+  if (input === "/skill" || input.startsWith("/skill ") || input.startsWith("/skill:")) {
+    await handleSkillCommand(input);
     return "handled";
   }
   if (input === "/notes") {
@@ -805,7 +825,7 @@ async function runConfigCommand(input: string): Promise<void> {
       [key]: parseConfigValue(key, rawValue)
     };
     saveDemoConfig(demoConfig);
-    reloadRuntimeFromConfig();
+    await reloadRuntimeFromConfig();
     await resetConversationToNewSession("[config] saved and applied; conversation reset");
     console.log(`[config] set ${key}=${formatConfigValue(key, demoConfig[key])}`);
     return;
@@ -821,7 +841,7 @@ async function runConfigCommand(input: string): Promise<void> {
     delete next[key];
     demoConfig = next;
     saveDemoConfig(demoConfig);
-    reloadRuntimeFromConfig();
+    await reloadRuntimeFromConfig();
     await resetConversationToNewSession("[config] saved and applied; conversation reset");
     console.log(`[config] unset ${key}`);
     return;
@@ -835,7 +855,7 @@ async function runConfigCommand(input: string): Promise<void> {
 
   if (normalized === "reload") {
     demoConfig = loadDemoConfig();
-    reloadRuntimeFromConfig();
+    await reloadRuntimeFromConfig();
     await resetConversationToNewSession(`[config] reloaded ${CONFIG_PATH}; conversation reset`);
     return;
   }
@@ -843,7 +863,7 @@ async function runConfigCommand(input: string): Promise<void> {
   if (normalized === "reset") {
     demoConfig = {};
     saveDemoConfig(demoConfig);
-    reloadRuntimeFromConfig();
+    await reloadRuntimeFromConfig();
     await resetConversationToNewSession(`[config] reset ${CONFIG_PATH}; conversation reset`);
     return;
   }
@@ -851,12 +871,17 @@ async function runConfigCommand(input: string): Promise<void> {
   console.log(`[config] unknown subcommand: ${subcommand}. Try /config help.`);
 }
 
-function reloadRuntimeFromConfig(): void {
+async function reloadRuntimeFromConfig(): Promise<void> {
   llm = createMainLlmClient();
   compressionLlm = createCompressionLlmClient(llm);
   summaryLlm = createSummaryLlmClient(llm);
   toolset = resolveToolset();
   maxTurns = resolveMaxTurns();
+  loadedSkills = loadDemoSkills();
+  if (mcpManager) {
+    await mcpManager.close();
+  }
+  mcpManager = await createDemoMcpManager();
   usageLedger = new SessionUsageLedger();
   exchangeCount = 0;
   workspaceMemory = new WorkspaceMemory();
@@ -935,6 +960,57 @@ async function handleMemoryCommand(input: string): Promise<void> {
   console.log("[memory] usage: /memory, /memory on, /memory off");
 }
 
+async function handleSkillCommand(input: string): Promise<void> {
+  if (input === "/skill" || input === "/skill list") {
+    printSkillStatus();
+    return;
+  }
+
+  if (input === "/skill reload") {
+    loadedSkills = loadDemoSkills();
+    agent = createDemoAgent();
+    printSkillStatus();
+    return;
+  }
+
+  if (input.startsWith("/skill:")) {
+    const rest = input.slice("/skill:".length).trim();
+    const [name = "", ...args] = rest.split(/\s+/);
+    await runExplicitSkill(name, args.join(" "));
+    return;
+  }
+
+  console.log("[skill] usage: /skill, /skill reload, /skill:<name> [args]");
+}
+
+function printSkillStatus(): void {
+  console.log(`[skill] loaded=${loadedSkills.skills.length} diagnostics=${loadedSkills.diagnostics.length}`);
+  for (const skill of loadedSkills.skills) {
+    const hidden = skill.disableModelInvocation ? " hidden" : "";
+    console.log(`[skill] ${skill.name}${hidden} ${skill.filePath} - ${skill.description}`);
+  }
+  for (const diagnostic of loadedSkills.diagnostics) {
+    console.log(`[skill:${diagnostic.level}] ${diagnostic.path ?? ""} ${diagnostic.message}`.trim());
+  }
+}
+
+async function runExplicitSkill(name: string, args: string): Promise<void> {
+  const skill = loadedSkills.skills.find((candidate) => candidate.name === name);
+  if (!skill) {
+    console.log(`[skill] not found: ${name}`);
+    return;
+  }
+  const body = await readFile(skill.filePath, "utf8");
+  const prompt = [
+    "Use this skill for the next task.",
+    "",
+    formatSkillInvocation(skill, body, args),
+    "",
+    args ? `User arguments: ${args}` : "Run the skill according to its instructions."
+  ].join("\n");
+  await runUserPrompt(prompt);
+}
+
 async function runManualCompaction(): Promise<void> {
   if (agent.history.length === 0) {
     console.log("[compact] no conversation history yet");
@@ -965,7 +1041,7 @@ function renderBanner(mode: "tui" | "one-shot"): void {
     console.log(`compression_provider=${compressionLlm.provider} compression_model=${compressionLlm.model}`);
   }
   console.log(`phase_summary=paused summary_provider=${summaryLlm.provider} summary_model=${summaryLlm.model}`);
-  console.log(`toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
+  console.log(`toolset=${toolset} maxTurns=${maxTurns ?? "default"} skills=${loadedSkills.skills.length} mcp_tools=${mcpManager?.getToolInfos().length ?? 0}`);
   if (mode === "tui") {
     console.log(`session=${activeSession ? `${activeSession.id} "${activeSession.title}"` : "(new on first message)"}`);
   }
@@ -975,7 +1051,7 @@ function renderBanner(mode: "tui" | "one-shot"): void {
     } phase_memory=off`
   );
   if (mode === "tui") {
-    console.log("commands=/help /usage /sessions /session /config /memory /plan /notes /compact /new /clear /exit");
+    console.log("commands=/help /usage /sessions /session /config /memory /plan /skill /notes /compact /new /clear /exit");
   }
 }
 
@@ -996,7 +1072,7 @@ Environment:
   AGENT_DYNAMIC_COMPRESSION=1
 
 Interactive commands:
-  /usage, /sessions, /session, /config, /memory, /plan, /notes, /compact, /new, /clear, /exit
+  /usage, /sessions, /session, /config, /memory, /plan, /skill, /notes, /compact, /new, /clear, /exit
 
 Plan mode:
   Add #plan to any request, or use /plan run <request>, to force plan mode.
@@ -1011,6 +1087,7 @@ function printTuiHelp(): void {
   /config show current config and change runtime settings
   /memory show, enable, or disable the long-term Markdown memory store
   /plan   show current structured plan; subcommands: json/approve/run/clear
+  /skill  list skills; use /skill:<name> [args] to invoke one explicitly
   /notes  show current workspace notes
   /forget-notes clear current workspace notes
   /compact manually summarize and compact the current conversation history
@@ -1040,6 +1117,8 @@ Examples:
   /config set dynamicCompression true
   /config set memoryPath .agent-memory/MEMORY.md
   /config set maxMemoryResults 8
+  /config set skillPaths .singularity/skills,/tmp/agent-skills
+  /config set mcpConfigPath .singularity/mcp.json
   /config set summaryModel gpt-4.1-mini
   /config set compressionModel gpt-4.1-mini`);
 }
@@ -1060,6 +1139,8 @@ function printConfig(): void {
   }
   console.log(`[config] phaseSummary=paused summaryProvider=${summaryLlm.provider} summaryModel=${summaryLlm.model}`);
   console.log(`[config] toolset=${toolset} maxTurns=${maxTurns ?? "default"}`);
+  console.log(`[config] skillPaths=${demoConfig.skillPaths ?? ".singularity/skills"} skills=${loadedSkills.skills.length}`);
+  console.log(`[config] mcpConfigPath=${demoConfig.mcpConfigPath ?? "(none)"} mcpTools=${mcpManager?.getToolInfos().length ?? 0}`);
   const context = buildContextOptions();
   console.log(`[config] dynamicCompression=${context?.dynamicCompression ? "true" : "false"}`);
   printMemoryStatus();
@@ -1385,6 +1466,42 @@ function parseDynamicCompressionOptions(): ContextEngineOptions["dynamicCompress
   };
 }
 
+function loadDemoSkills(): SkillLoadResult {
+  return loadSkillsSync({
+    roots: parseListConfig(demoConfig.skillPaths) ?? [".singularity/skills"],
+    cwd: process.cwd()
+  });
+}
+
+async function createDemoMcpManager(): Promise<McpManager | undefined> {
+  const configPath = demoConfig.mcpConfigPath;
+  if (!configPath) {
+    return undefined;
+  }
+
+  try {
+    const raw = await readFile(configPath, "utf8");
+    const parsed = JSON.parse(raw) as McpConfig;
+    const manager = new McpManager({ config: parsed });
+    await manager.start();
+    for (const diagnostic of manager.getDiagnostics()) {
+      console.warn(`[mcp:${diagnostic.level}] ${diagnostic.serverName} ${diagnostic.message}`);
+    }
+    return manager;
+  } catch (error) {
+    console.error(`[mcp:error] failed to load ${configPath}: ${formatError(error)}`);
+    return undefined;
+  }
+}
+
+function parseListConfig(value: string | undefined): string[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const items = value.split(",").map((item) => item.trim()).filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
 function resolvePhaseSummaryEnabled(): boolean {
   return false;
 }
@@ -1486,7 +1603,9 @@ function isStringKey(key: DemoConfigKey): boolean {
     key === "summaryApiKey" ||
     key === "summaryBaseURL" ||
     key === "tavilyApiKey" ||
-    key === "memoryPath"
+    key === "memoryPath" ||
+    key === "skillPaths" ||
+    key === "mcpConfigPath"
   );
 }
 

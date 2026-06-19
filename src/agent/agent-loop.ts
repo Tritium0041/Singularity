@@ -37,6 +37,7 @@ import {
   type PhaseSummaryConfig,
   type WorkspaceState
 } from "../memory/index.js";
+import { McpManager, type McpConfig } from "../mcp/index.js";
 import {
   buildPlanningInstructions,
   createPlanningTools,
@@ -48,6 +49,7 @@ import {
   hasOpenPlanSteps,
   type PlanState
 } from "../planning/index.js";
+import { buildSkillsPromptFragment, loadSkillsSync, type SkillLoadOptions, type SkillLoadResult } from "../skills/index.js";
 import { ToolExecutor, ToolRegistry, type AgentTool, type ToolExecutionMode } from "../tools/registry.js";
 
 const PHASE_SUMMARY_RUNTIME_ENABLED = false;
@@ -82,6 +84,8 @@ export type AgentConfig = {
   context?: false | ContextEngineOptions;
   background?: false | SystemPromptBackgroundOptions;
   promptFragments?: readonly PromptFragment[];
+  skills?: false | SkillLoadOptions | SkillLoadResult;
+  mcp?: false | McpManager | McpConfig;
   history?: readonly AgentMessage[];
   memory?:
     | false
@@ -146,6 +150,9 @@ export class Agent {
   private readonly dynamicCompressionState: DynamicCompressionState;
   private readonly memory: ResolvedAgentMemory | undefined;
   private readonly planning: ResolvedAgentPlanning | undefined;
+  private readonly skills: SkillLoadResult | undefined;
+  private readonly mcp: McpManager | undefined;
+  private mcpStartPromise: Promise<void> | undefined;
   private readonly backgroundTasks = new Set<Promise<void>>();
   private phaseSummaryQueue: Promise<void> = Promise.resolve();
 
@@ -164,6 +171,8 @@ export class Agent {
     this.dynamicCompressionState = getInitialDynamicCompressionState(config.context);
     this.memory = this.resolveMemoryConfig(config.memory);
     this.planning = this.resolvePlanningConfig(config.planning);
+    this.skills = this.resolveSkillsConfig(config.skills);
+    this.mcp = this.resolveMcpConfig(config.mcp);
     this.messages.push(...(config.history ?? []).map(cloneAgentMessage));
     this.systemPrompt = this.buildSystemPrompt(config);
   }
@@ -219,6 +228,11 @@ export class Agent {
     while (this.backgroundTasks.size > 0) {
       await Promise.all([...this.backgroundTasks]);
     }
+  }
+
+  async close(): Promise<void> {
+    await this.waitForBackgroundTasks();
+    await this.mcp?.close();
   }
 
   async *runEvents(input: string, options: AgentRunOptions = {}): AsyncIterable<AgentEvent> {
@@ -284,6 +298,7 @@ export class Agent {
     await this.emit({ type: "agent_start", input: `[tool:${toolCall.name}]` }, streamEventSink);
 
     const contextOptions = this.resolveContextOptions(options.context);
+    await this.ensureMcpStarted();
     const registry = this.buildRuntimeToolRegistry(contextOptions);
     const executor = new ToolExecutor(registry);
     const assistant: AssistantMessage = {
@@ -443,6 +458,7 @@ export class Agent {
     planningMode: RuntimePlanningMode = "normal"
   ): Promise<PreparedAgentRequest> {
     const contextOptions = this.resolveContextOptions(runContext);
+    await this.ensureMcpStarted();
     const registry = this.buildRuntimeToolRegistry(contextOptions);
     const executor = new ToolExecutor(registry);
     const systemPrompt = this.withRuntimePlanningMode(this.withDynamicPlanningSnapshot(request.systemPrompt), planningMode);
@@ -509,6 +525,9 @@ export class Agent {
     if (this.planning) {
       tools.push(...createPlanningTools(this.planning.planner));
     }
+    if (this.mcp) {
+      tools.push(...this.mcp.getTools());
+    }
     const visibleTools = this.shouldGatePrePlanTools() ? tools.filter((tool) => isAllowedBeforePlan(tool, this.planning?.planner.state)) : tools;
     return new ToolRegistry(visibleTools);
   }
@@ -541,7 +560,41 @@ export class Agent {
     if (this.planning?.includeInstructions) {
       fragments.push(buildPlanningInstructions({ requirePlanBeforeMutation: this.planning.requirePlanBeforeMutation }));
     }
+    if (this.skills && this.tools.get("read_file")) {
+      const skillFragment = buildSkillsPromptFragment(this.skills);
+      if (skillFragment) {
+        fragments.push(skillFragment);
+      }
+    }
     return fragments;
+  }
+
+  private resolveSkillsConfig(config: AgentConfig["skills"]): SkillLoadResult | undefined {
+    if (config === false) {
+      return undefined;
+    }
+    if (isSkillLoadResult(config)) {
+      return config;
+    }
+    return loadSkillsSync(config ?? {});
+  }
+
+  private resolveMcpConfig(config: AgentConfig["mcp"]): McpManager | undefined {
+    if (config === false || config === undefined) {
+      return undefined;
+    }
+    if (config instanceof McpManager) {
+      return config;
+    }
+    return new McpManager(config);
+  }
+
+  private async ensureMcpStarted(): Promise<void> {
+    if (!this.mcp) {
+      return;
+    }
+    this.mcpStartPromise ??= this.mcp.start();
+    await this.mcpStartPromise;
   }
 
   private resolveMemoryConfig(config: AgentConfig["memory"]): ResolvedAgentMemory | undefined {
@@ -1005,6 +1058,10 @@ function resolvePlanner(planner: Planner | PlanState | undefined): Planner {
     return planner;
   }
   return new Planner(planner);
+}
+
+function isSkillLoadResult(value: unknown): value is SkillLoadResult {
+  return Boolean(value && typeof value === "object" && Array.isArray((value as { skills?: unknown }).skills));
 }
 
 function clampMemoryResults(value: number): number {

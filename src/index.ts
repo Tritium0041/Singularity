@@ -8,6 +8,8 @@ export * from "./llm/env-factory.js";
 export * from "./llm/provider-registry.js";
 export * from "./context/index.js";
 export * from "./memory/index.js";
+export * from "./skills/index.js";
+export * from "./mcp/index.js";
 export * from "./planning/index.js";
 export * from "./session/index.js";
 export * from "./tools/registry.js";
