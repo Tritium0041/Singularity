@@ -1,4 +1,12 @@
-import type { AgentMessage, AssistantMessage, ReasoningOptions, TokenUsage, ToolCall, ToolResultMessage } from "../types.js";
+import type {
+  AgentMessage,
+  AssistantMessage,
+  ReasoningOptions,
+  ReasoningReplay,
+  TokenUsage,
+  ToolCall,
+  ToolResultMessage
+} from "../types.js";
 import type { LlmProviderFactory, LlmRequest, LlmStreamEvent, LlmToolSpec, StreamingLlmClient } from "./types.js";
 import { parseServerSentEvents } from "./sse.js";
 import { cleanTokenUsage, mergeTokenUsage } from "./usage.js";
@@ -19,6 +27,8 @@ type AnthropicMessage = {
 
 type AnthropicContentBlock =
   | { type: "text"; text: string }
+  | { type: "thinking"; thinking: string; signature?: string }
+  | { type: "redacted_thinking"; data: string }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
 
@@ -33,6 +43,8 @@ type AnthropicBody = {
     type?: string;
     text?: string;
     thinking?: string;
+    signature?: string;
+    data?: string;
     id?: string;
     name?: string;
     input?: unknown;
@@ -58,6 +70,8 @@ type AnthropicStreamEvent = {
     type?: string;
     text?: string;
     thinking?: string;
+    signature?: string;
+    data?: string;
     id?: string;
     name?: string;
     input?: unknown;
@@ -66,6 +80,8 @@ type AnthropicStreamEvent = {
     type?: string;
     text?: string;
     thinking?: string;
+    signature?: string;
+    data?: string;
     partial_json?: string;
   };
   usage?: AnthropicUsage;
@@ -76,6 +92,10 @@ type PendingToolCall = {
   name: string;
   argumentsText: string;
 };
+
+type PendingThinkingBlock =
+  | { type: "thinking"; thinking: string; signature?: string }
+  | { type: "redacted_thinking"; data: string };
 
 export class AnthropicMessagesClient implements StreamingLlmClient {
   private readonly apiKey: string | undefined;
@@ -116,7 +136,7 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
     }
 
     let content = "";
-    let thinkingContent = "";
+    const thinkingBlocksByIndex = new Map<number, PendingThinkingBlock>();
     let completed = false;
     let usage: TokenUsage | undefined;
     const rawEvents: AnthropicStreamEvent[] = [];
@@ -149,6 +169,27 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
         continue;
       }
 
+      if (event.type === "content_block_start" && isThinkingBlockType(event.content_block?.type)) {
+        const index = event.index ?? thinkingBlocksByIndex.size;
+        if (event.content_block.type === "thinking") {
+          const block: PendingThinkingBlock = {
+            type: "thinking",
+            thinking: event.content_block.thinking ?? "",
+            ...(event.content_block.signature ? { signature: event.content_block.signature } : {})
+          };
+          thinkingBlocksByIndex.set(index, block);
+          if (block.thinking) {
+            yield { type: "thinking_delta", delta: block.thinking };
+          }
+        } else {
+          thinkingBlocksByIndex.set(index, {
+            type: "redacted_thinking",
+            data: event.content_block.data ?? ""
+          });
+        }
+        continue;
+      }
+
       if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
         content += event.delta.text;
         yield { type: "text_delta", delta: event.delta.text };
@@ -156,8 +197,21 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
       }
 
       if (event.type === "content_block_delta" && event.delta?.type === "thinking_delta" && event.delta.thinking) {
-        thinkingContent += event.delta.thinking;
+        const block = getOrCreateThinkingBlock(thinkingBlocksByIndex, event.index);
+        block.thinking += event.delta.thinking;
         yield { type: "thinking_delta", delta: event.delta.thinking };
+        continue;
+      }
+
+      if (event.type === "content_block_delta" && event.delta?.type === "signature_delta" && event.delta.signature) {
+        const block = getOrCreateThinkingBlock(thinkingBlocksByIndex, event.index);
+        block.signature = `${block.signature ?? ""}${event.delta.signature}`;
+        continue;
+      }
+
+      if (event.type === "content_block_delta" && event.delta?.type === "redacted_thinking_delta" && event.delta.data) {
+        const block = getOrCreateRedactedThinkingBlock(thinkingBlocksByIndex, event.index);
+        block.data += event.delta.data;
         continue;
       }
 
@@ -181,12 +235,18 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
 
       if (event.type === "message_stop") {
         completed = true;
-        yield { type: "done", message: assistantFromStream(content, thinkingContent, [...toolCallsByIndex.values()], usage, rawEvents) };
+        yield {
+          type: "done",
+          message: assistantFromStream(content, [...thinkingBlocksByIndex.values()], [...toolCallsByIndex.values()], usage, rawEvents)
+        };
       }
     }
 
     if (!completed) {
-      yield { type: "done", message: assistantFromStream(content, thinkingContent, [...toolCallsByIndex.values()], usage, rawEvents) };
+      yield {
+        type: "done",
+        message: assistantFromStream(content, [...thinkingBlocksByIndex.values()], [...toolCallsByIndex.values()], usage, rawEvents)
+      };
     }
   }
 
@@ -199,10 +259,11 @@ export class AnthropicMessagesClient implements StreamingLlmClient {
 
   private async createMessage(request: LlmRequest, apiKey: string, stream: boolean): Promise<Response> {
     const reasoning = request.reasoning !== undefined ? request.reasoning : this.defaultReasoning;
+    const messages = toAnthropicMessages(request.messages);
     const body: Record<string, unknown> = {
       model: request.model || this.defaultModel,
       system: request.systemPrompt,
-      messages: toAnthropicMessages(request.messages),
+      messages,
       tools: request.tools && request.tools.length > 0 ? request.tools.map(toAnthropicTool) : undefined,
       max_tokens: this.defaultMaxTokens,
       stream
@@ -235,6 +296,7 @@ export const anthropicMessagesProvider: LlmProviderFactory = {
 
 function toAnthropicMessages(messages: AgentMessage[]): AnthropicMessage[] {
   const result: AnthropicMessage[] = [];
+  let latestReplayBlocks: AnthropicContentBlock[] = [];
 
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
@@ -247,6 +309,9 @@ function toAnthropicMessages(messages: AgentMessage[]): AnthropicMessage[] {
 
     if (message.role === "assistant") {
       const blocks: AnthropicContentBlock[] = [];
+      const replayBlocks = anthropicReplayBlocks(message);
+      const replayPrefix = replayBlocks.length > 0 ? replayBlocks : message.toolCalls && message.toolCalls.length > 0 ? latestReplayBlocks : [];
+      blocks.push(...replayPrefix.map((block) => ({ ...block })));
       if (message.content.trim()) {
         blocks.push({ type: "text", text: message.content });
       }
@@ -260,6 +325,9 @@ function toAnthropicMessages(messages: AgentMessage[]): AnthropicMessage[] {
       }
       if (blocks.length > 0) {
         result.push({ role: "assistant", content: blocks });
+      }
+      if (replayBlocks.length > 0) {
+        latestReplayBlocks = replayBlocks.map((block) => ({ ...block }));
       }
       continue;
     }
@@ -296,7 +364,7 @@ function toAnthropicTool(tool: LlmToolSpec): AnthropicTool {
 
 function assistantFromBody(body: AnthropicBody): AssistantMessage {
   const contentParts: string[] = [];
-  const thinkingParts: string[] = [];
+  const thinkingBlocks: PendingThinkingBlock[] = [];
   const toolCalls: ToolCall[] = [];
 
   for (const block of body.content ?? []) {
@@ -304,7 +372,18 @@ function assistantFromBody(body: AnthropicBody): AssistantMessage {
       contentParts.push(block.text ?? "");
     }
     if (block.type === "thinking") {
-      thinkingParts.push(block.thinking ?? "");
+      const thinkingBlock: PendingThinkingBlock = {
+        type: "thinking",
+        thinking: block.thinking ?? "",
+        ...(block.signature ? { signature: block.signature } : {})
+      };
+      thinkingBlocks.push(thinkingBlock);
+    }
+    if (block.type === "redacted_thinking") {
+      thinkingBlocks.push({
+        type: "redacted_thinking",
+        data: block.data ?? ""
+      });
     }
     if (block.type === "tool_use") {
       toolCalls.push({
@@ -318,7 +397,7 @@ function assistantFromBody(body: AnthropicBody): AssistantMessage {
   return {
     role: "assistant",
     content: contentParts.join(""),
-    reasoning: thinkingParts.length > 0 ? { summary: thinkingParts.join("\n\n") } : undefined,
+    reasoning: reasoningFromAnthropicBlocks(thinkingBlocks),
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
     usage: usageFromAnthropic(body.usage),
     raw: body
@@ -327,7 +406,7 @@ function assistantFromBody(body: AnthropicBody): AssistantMessage {
 
 function assistantFromStream(
   content: string,
-  thinkingContent: string,
+  thinkingBlocks: PendingThinkingBlock[],
   pendingToolCalls: PendingToolCall[],
   usage: TokenUsage | undefined,
   rawEvents: AnthropicStreamEvent[]
@@ -341,11 +420,78 @@ function assistantFromStream(
   return {
     role: "assistant",
     content,
-    reasoning: thinkingContent ? { summary: thinkingContent } : undefined,
+    reasoning: reasoningFromAnthropicBlocks(thinkingBlocks),
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
     usage,
     raw: rawEvents
   };
+}
+
+function reasoningFromAnthropicBlocks(thinkingBlocks: PendingThinkingBlock[]): AssistantMessage["reasoning"] {
+  const replayBlocks = normalizeAnthropicReplayBlocks(thinkingBlocks);
+  const summary = replayBlocks
+    .filter((block): block is Extract<PendingThinkingBlock, { type: "thinking" }> => block.type === "thinking" && block.thinking.length > 0)
+    .map((block) => block.thinking)
+    .join("\n\n");
+  if (!summary && replayBlocks.length === 0) {
+    return undefined;
+  }
+  return {
+    ...(summary ? { summary } : {}),
+    ...(replayBlocks.length > 0 ? { replay: [{ provider: "anthropic", blocks: replayBlocks }] } : {})
+  };
+}
+
+function normalizeAnthropicReplayBlocks(blocks: PendingThinkingBlock[]): PendingThinkingBlock[] {
+  return blocks
+    .map((block) => {
+      if (block.type === "thinking") {
+        return {
+          type: "thinking" as const,
+          thinking: block.thinking,
+          ...(block.signature ? { signature: block.signature } : {})
+        };
+      }
+      return {
+        type: "redacted_thinking" as const,
+        data: block.data
+      };
+    })
+    .filter((block) => (block.type === "thinking" ? block.thinking.length > 0 : block.data.length > 0));
+}
+
+function anthropicReplayBlocks(message: AssistantMessage): AnthropicContentBlock[] {
+  const replay = message.reasoning?.replay?.find((item): item is Extract<ReasoningReplay, { provider: "anthropic" }> => item.provider === "anthropic");
+  return replay?.blocks.map((block) => ({ ...block })) ?? [];
+}
+
+function isThinkingBlockType(type: string | undefined): type is "thinking" | "redacted_thinking" {
+  return type === "thinking" || type === "redacted_thinking";
+}
+
+function getOrCreateThinkingBlock(blocks: Map<number, PendingThinkingBlock>, index: number | undefined): Extract<PendingThinkingBlock, { type: "thinking" }> {
+  const key = index ?? blocks.size;
+  const existing = blocks.get(key);
+  if (existing?.type === "thinking") {
+    return existing;
+  }
+  const block: PendingThinkingBlock = { type: "thinking", thinking: "" };
+  blocks.set(key, block);
+  return block;
+}
+
+function getOrCreateRedactedThinkingBlock(
+  blocks: Map<number, PendingThinkingBlock>,
+  index: number | undefined
+): Extract<PendingThinkingBlock, { type: "redacted_thinking" }> {
+  const key = index ?? blocks.size;
+  const existing = blocks.get(key);
+  if (existing?.type === "redacted_thinking") {
+    return existing;
+  }
+  const block: PendingThinkingBlock = { type: "redacted_thinking", data: "" };
+  blocks.set(key, block);
+  return block;
 }
 
 function usageFromAnthropic(usage: AnthropicUsage | undefined): TokenUsage | undefined {

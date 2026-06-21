@@ -167,6 +167,39 @@ test("OpenAI Chat client requests and maps streaming usage chunk", async () => {
   });
 });
 
+test("OpenAI Chat client preserves and replays reasoning content", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const client = new OpenAIChatCompletionsClient({
+    apiKey: "test-key",
+    fetchImpl: async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({
+        choices: [{ message: { content: "ok" } }]
+      });
+    }
+  });
+
+  await client.complete({
+    model: "test-model",
+    messages: [
+      {
+        role: "assistant",
+        content: "",
+        reasoning: {
+          replay: [{ provider: "openai-chat", field: "reasoning_content", content: "checked plan" }]
+        },
+        toolCalls: [{ id: "call_1", name: "calculator", arguments: { expression: "1 + 1" } }]
+      }
+    ]
+  });
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>;
+  assert.equal(messages[0]?.reasoning_content, "checked plan");
+
+  const message = await client.complete({ model: "test-model", messages: [{ role: "user", content: "hi" }] });
+  assert.equal(message.content, "ok");
+});
+
 test("Anthropic client sends system prompt, tools, and tool results in Messages format", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const client = new AnthropicMessagesClient({
@@ -202,6 +235,73 @@ test("Anthropic client sends system prompt, tools, and tool results in Messages 
   const tools = requestBody?.tools as Array<{ name: string; input_schema: Record<string, unknown> }>;
   assert.equal(tools[0]?.name, "calculator");
   assert.equal(tools[0]?.input_schema.type, "object");
+});
+
+test("Anthropic client replays thinking blocks before tool use", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const client = new AnthropicMessagesClient({
+    apiKey: "test-key",
+    fetchImpl: async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({ content: [{ type: "text", text: "ok" }] });
+    }
+  });
+
+  await client.complete({
+    model: "claude-test",
+    messages: [
+      {
+        role: "assistant",
+        content: "",
+        reasoning: {
+          summary: "made a plan",
+          replay: [{ provider: "anthropic", blocks: [{ type: "thinking", thinking: "made a plan", signature: "sig_1" }] }]
+        },
+        toolCalls: [{ id: "toolu_1", name: "calculator", arguments: { expression: "1 + 1" } }]
+      },
+      { role: "tool", toolCallId: "toolu_1", toolName: "calculator", content: "2" }
+    ],
+    reasoning: { effort: "high" }
+  });
+
+  assert.deepEqual(requestBody?.thinking, { type: "enabled", budget_tokens: 1024 });
+  const messages = requestBody?.messages as Array<{ role: string; content: unknown }>;
+  assert.deepEqual(messages[0]?.content, [
+    { type: "thinking", thinking: "made a plan", signature: "sig_1" },
+    { type: "tool_use", id: "toolu_1", name: "calculator", input: { expression: "1 + 1" } }
+  ]);
+  assert.deepEqual(messages[1]?.content, [{ type: "tool_result", tool_use_id: "toolu_1", content: "2" }]);
+});
+
+test("Anthropic client captures thinking signatures from streaming responses", async () => {
+  const sse = [
+    sseEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+    sseEvent({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "make " } }),
+    sseEvent({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "plan" } }),
+    sseEvent({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig_stream" } }),
+    sseEvent({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "calculator", input: {} } }),
+    sseEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"expression\":\"3 + 4\"}" } }),
+    sseEvent({ type: "message_stop" })
+  ].join("");
+  const client = new AnthropicMessagesClient({
+    apiKey: "test-key",
+    fetchImpl: async () => streamResponse(sse)
+  });
+
+  const events = [];
+  for await (const event of client.stream({ model: "claude-test", messages: [{ role: "user", content: "hi" }] })) {
+    events.push(event);
+  }
+
+  const done = events.at(-1);
+  assert.equal(done?.type, "done");
+  if (done?.type !== "done") {
+    throw new Error("Expected done event");
+  }
+  assert.equal(done.message.reasoning?.summary, "make plan");
+  assert.deepEqual(done.message.reasoning?.replay, [
+    { provider: "anthropic", blocks: [{ type: "thinking", thinking: "make plan", signature: "sig_stream" }] }
+  ]);
 });
 
 test("Anthropic client maps non-streaming usage including cache tokens", async () => {

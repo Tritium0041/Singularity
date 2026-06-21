@@ -1,19 +1,39 @@
-import type { ToolAccess } from "../tools/registry.js";
-
 export type McpToolFilter = {
   enabledTools?: string[];
   disabledTools?: string[];
 };
 
-export type McpServerConfig = McpToolFilter & {
+export type McpBaseServerConfig = McpToolFilter & {
+  enabled?: boolean;
+};
+
+export type McpStdioServerConfig = McpBaseServerConfig & {
   transport: "stdio";
   command: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
-  enabled?: boolean;
-  access?: ToolAccess;
 };
+
+export type McpHttpServerConfig = McpBaseServerConfig & {
+  transport: "streamable-http" | "streamable_http" | "streamableHttp" | "http";
+  url: string;
+  headers?: Record<string, string>;
+  sessionId?: string;
+};
+
+export type McpSseServerConfig = McpBaseServerConfig & {
+  transport: "sse";
+  url: string;
+  headers?: Record<string, string>;
+};
+
+export type McpWebSocketServerConfig = McpBaseServerConfig & {
+  transport: "websocket" | "websocket-client" | "ws";
+  url: string;
+};
+
+export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig | McpSseServerConfig | McpWebSocketServerConfig;
 
 export type McpConfig = {
   servers: Record<string, McpServerConfig>;
@@ -24,7 +44,6 @@ export type McpToolInfo = {
   rawName: string;
   name: string;
   description: string;
-  access: ToolAccess;
 };
 
 export type McpDiagnostic = {

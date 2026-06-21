@@ -183,7 +183,7 @@ Set `disable-model-invocation: true` in frontmatter to hide a skill from implici
 
 ## MCP
 
-MCP v1 supports stdio servers. Start a manager, pass it to the agent, and its tools are exposed through the normal tool registry.
+MCP servers can be connected over stdio, Streamable HTTP, legacy SSE, or WebSocket. Start a manager, pass it to the agent, and its tools are exposed through the normal tool registry.
 
 ```json
 {
@@ -193,6 +193,21 @@ MCP v1 supports stdio servers. Start a manager, pass it to the agent, and its to
       "command": "node",
       "args": ["./mcp-docs-server.js"],
       "enabledTools": ["search_docs"]
+    },
+    "remote-docs": {
+      "transport": "streamable-http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer dev-token"
+      }
+    },
+    "legacy-docs": {
+      "transport": "sse",
+      "url": "http://127.0.0.1:3001/sse"
+    },
+    "socket-docs": {
+      "transport": "websocket",
+      "url": "ws://127.0.0.1:3002"
     }
   }
 }
@@ -210,7 +225,7 @@ const agent = new Agent({
 });
 ```
 
-MCP tools are named `mcp_<server>_<tool>` after normalization. v1 does not include HTTP transport, OAuth, resources, deferred tools, or a separate approval UI.
+MCP tools are named `mcp_<server>_<tool>` after normalization. The config accepts `enabledTools` and `disabledTools` filters for each server. Tool access is inferred from standard MCP tool annotations such as `readOnlyHint`; there is no Singularity-specific `access` field in MCP config. OAuth, resources, deferred tools, and a separate approval UI are not included yet.
 
 OpenAI-compatible local or third-party providers can use the Chat Completions adapter:
 

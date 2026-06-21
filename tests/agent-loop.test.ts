@@ -557,6 +557,57 @@ test("plan approval can resume the model loop as a visible tool result", async (
   assert.equal(events.filter((event) => event.type === "turn_end").length, 3);
 });
 
+test("plan approval synthetic tool call carries prior thinking replay", async () => {
+  const planner = new Planner();
+  planner.create({
+    objective: "Approve with thinking replay",
+    steps: [{ id: "write", title: "Write file" }]
+  });
+  const llm = new SequenceLlm([
+    {
+      role: "assistant",
+      content: "approved"
+    }
+  ]);
+  const agent = new Agent({
+    llm,
+    model: "fake-model",
+    planning: { planner },
+    history: [
+      {
+        role: "assistant",
+        content: "",
+        reasoning: {
+          summary: "create plan",
+          replay: [{ provider: "anthropic", blocks: [{ type: "thinking", thinking: "create plan", signature: "sig_plan" }] }]
+        },
+        toolCalls: [{ id: "call_create_plan", name: CREATE_PLAN_TOOL_NAME, arguments: { objective: "Approve with thinking replay" } }]
+      },
+      {
+        role: "tool",
+        toolCallId: "call_create_plan",
+        toolName: CREATE_PLAN_TOOL_NAME,
+        content: "Plan created."
+      }
+    ]
+  });
+
+  await agent.continueWithToolCall(
+    { id: "call_approve_plan", name: APPROVE_PLAN_TOOL_NAME, arguments: { note: "Looks good" } },
+    { maxTurns: 1 }
+  );
+
+  const approvalAssistant = llm.requests[0]?.messages.at(-2);
+  assert.equal(approvalAssistant?.role, "assistant");
+  if (approvalAssistant?.role !== "assistant") {
+    throw new Error("Expected approval assistant");
+  }
+  assert.deepEqual(approvalAssistant.reasoning?.replay, [
+    { provider: "anthropic", blocks: [{ type: "thinking", thinking: "create plan", signature: "sig_plan" }] }
+  ]);
+  assert.equal(approvalAssistant.toolCalls?.[0]?.name, APPROVE_PLAN_TOOL_NAME);
+});
+
 test("agent exposes tool-call continuation as an async iterable event stream", async () => {
   const planner = new Planner();
   planner.create({

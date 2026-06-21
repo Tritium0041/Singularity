@@ -57,7 +57,22 @@ export type ReasoningOptions = {
 
 export type ReasoningOutput = {
   summary?: string;
+  replay?: ReasoningReplay[];
 };
+
+export type ReasoningReplay =
+  | {
+      provider: "anthropic";
+      blocks: Array<
+        | { type: "thinking"; thinking: string; signature?: string }
+        | { type: "redacted_thinking"; data: string }
+      >;
+    }
+  | {
+      provider: "openai-chat";
+      field: "reasoning_content" | "reasoning" | "reasoning_text";
+      content: string;
+    };
 
 export type TokenUsage = {
   inputTokens?: number;

@@ -8,6 +8,7 @@ import type {
   AgentRunResult,
   AssistantMessage,
   ReasoningOptions,
+  ReasoningReplay,
   ToolCall
 } from "../types.js";
 import {
@@ -301,11 +302,7 @@ export class Agent {
     await this.ensureMcpStarted();
     const registry = this.buildRuntimeToolRegistry(contextOptions);
     const executor = new ToolExecutor(registry);
-    const assistant: AssistantMessage = {
-      role: "assistant",
-      content: "",
-      toolCalls: [toolCall]
-    };
+    const assistant = this.buildSyntheticToolCallAssistant(toolCall);
     this.messages.push(assistant);
     await this.emit({ type: "message", message: assistant }, streamEventSink);
     await this.emit({ type: "tool_start", turn: 0, toolCall }, streamEventSink);
@@ -802,8 +799,57 @@ export class Agent {
   private withSyntheticToolCall(assistant: AssistantMessage, toolCall: NonNullable<AssistantMessage["toolCalls"]>[number]): AssistantMessage {
     return {
       ...assistant,
+      reasoning: assistant.reasoning ?? this.buildSyntheticToolCallReasoning(),
       toolCalls: [...(assistant.toolCalls ?? []), toolCall]
     };
+  }
+
+  private buildSyntheticToolCallAssistant(toolCall: ToolCall): AssistantMessage {
+    return {
+      role: "assistant",
+      content: "",
+      reasoning: this.buildSyntheticToolCallReasoning(),
+      toolCalls: [toolCall]
+    };
+  }
+
+  private buildSyntheticToolCallReasoning(): AssistantMessage["reasoning"] {
+    const replay = this.latestReasoningReplay();
+    if (replay.length === 0) {
+      return undefined;
+    }
+    return { replay };
+  }
+
+  private latestReasoningReplay(): ReasoningReplay[] {
+    const replay: ReasoningReplay[] = [];
+    const anthropic = this.latestReplayForProvider("anthropic");
+    if (anthropic) {
+      replay.push(anthropic);
+    }
+    const openAIChat = this.latestReplayForProvider("openai-chat");
+    if (openAIChat) {
+      replay.push(openAIChat);
+    }
+    return replay;
+  }
+
+  private latestReplayForProvider<TProvider extends ReasoningReplay["provider"]>(
+    provider: TProvider
+  ): Extract<ReasoningReplay, { provider: TProvider }> | undefined {
+    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
+      const message = this.messages[index];
+      if (message?.role !== "assistant") {
+        continue;
+      }
+      const replay = message.reasoning?.replay?.find(
+        (item): item is Extract<ReasoningReplay, { provider: TProvider }> => item.provider === provider
+      );
+      if (replay) {
+        return cloneJson(replay);
+      }
+    }
+    return undefined;
   }
 
   private enqueuePhaseSummary(
@@ -1093,6 +1139,10 @@ function isAllowedBeforePlan(tool: AgentTool, plan: PlanState | undefined): bool
 
 function cloneAgentMessage(message: AgentMessage): AgentMessage {
   return JSON.parse(JSON.stringify(message)) as AgentMessage;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function formatError(error: unknown): string {

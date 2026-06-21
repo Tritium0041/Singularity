@@ -1,4 +1,4 @@
-import type { AgentMessage, AssistantMessage, ReasoningOptions, TokenUsage, ToolCall } from "../types.js";
+import type { AgentMessage, AssistantMessage, ReasoningOptions, ReasoningReplay, TokenUsage, ToolCall } from "../types.js";
 import type { LlmProviderFactory, LlmRequest, LlmStreamEvent, LlmToolSpec, StreamingLlmClient } from "./types.js";
 import { parseServerSentEvents } from "./sse.js";
 import { cleanTokenUsage, mergeTokenUsage } from "./usage.js";
@@ -14,7 +14,14 @@ type OpenAIChatCompletionsClientOptions = {
 type ChatMessage =
   | { role: "system"; content: string }
   | { role: "user"; content: string }
-  | { role: "assistant"; content: string | null; tool_calls?: ChatToolCall[] }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: ChatToolCall[];
+      reasoning_content?: string;
+      reasoning?: string;
+      reasoning_text?: string;
+    }
   | { role: "tool"; tool_call_id: string; content: string };
 
 type ChatToolCall = {
@@ -84,6 +91,10 @@ type PendingToolCall = {
   argumentsText: string;
 };
 
+type OpenAIChatReasoningField = "reasoning_content" | "reasoning" | "reasoning_text";
+
+const OPENAI_CHAT_REASONING_FIELDS: OpenAIChatReasoningField[] = ["reasoning_content", "reasoning", "reasoning_text"];
+
 export class OpenAIChatCompletionsClient implements StreamingLlmClient {
   private readonly apiKey: string | undefined;
   private readonly baseURL: string;
@@ -124,6 +135,7 @@ export class OpenAIChatCompletionsClient implements StreamingLlmClient {
 
     let content = "";
     let thinkingContent = "";
+    let thinkingField: OpenAIChatReasoningField | undefined;
     let usage: TokenUsage | undefined;
     const rawEvents: ChatCompletionsBody[] = [];
     const toolCallsByIndex = new Map<number, PendingToolCall>();
@@ -144,10 +156,11 @@ export class OpenAIChatCompletionsClient implements StreamingLlmClient {
         yield { type: "text_delta", delta: textDelta };
       }
 
-      const thinkingDelta = firstString(choice.delta, ["reasoning_content", "reasoning", "reasoning_text"]);
+      const thinkingDelta = firstReasoningField(choice.delta);
       if (thinkingDelta) {
-        thinkingContent += thinkingDelta;
-        yield { type: "thinking_delta", delta: thinkingDelta };
+        thinkingField ??= thinkingDelta.field;
+        thinkingContent += thinkingDelta.content;
+        yield { type: "thinking_delta", delta: thinkingDelta.content };
       }
 
       for (const deltaToolCall of choice.delta.tool_calls ?? []) {
@@ -179,7 +192,7 @@ export class OpenAIChatCompletionsClient implements StreamingLlmClient {
       message: {
         role: "assistant",
         content,
-        reasoning: thinkingContent ? { summary: thinkingContent } : undefined,
+        reasoning: reasoningFromOpenAIChat(thinkingContent, thinkingField),
         toolCalls: pendingToolCallsToToolCalls([...toolCallsByIndex.values()]),
         usage,
         raw: rawEvents
@@ -228,6 +241,7 @@ export const openAIChatCompletionsProvider: LlmProviderFactory = {
 
 function toChatMessages(messages: AgentMessage[], systemPrompt?: string): ChatMessage[] {
   const result: ChatMessage[] = [];
+  let latestReplay: Extract<ReasoningReplay, { provider: "openai-chat" }> | undefined;
   if (systemPrompt) {
     result.push({ role: "system", content: systemPrompt });
   }
@@ -243,6 +257,11 @@ function toChatMessages(messages: AgentMessage[], systemPrompt?: string): ChatMe
         role: "assistant",
         content: message.content || null
       };
+      const messageReplay = openAIChatReplay(message);
+      const replay = messageReplay ?? (message.toolCalls && message.toolCalls.length > 0 ? latestReplay : undefined);
+      if (replay) {
+        assistantMessage[replay.field] = replay.content;
+      }
       if (message.toolCalls && message.toolCalls.length > 0) {
         assistantMessage.tool_calls = message.toolCalls.map((toolCall) => ({
           id: toolCall.id,
@@ -254,6 +273,9 @@ function toChatMessages(messages: AgentMessage[], systemPrompt?: string): ChatMe
         }));
       }
       result.push(assistantMessage);
+      if (messageReplay) {
+        latestReplay = { ...messageReplay };
+      }
       continue;
     }
 
@@ -281,15 +303,37 @@ function toChatTool(tool: LlmToolSpec): ChatTool {
 
 function assistantFromBody(body: ChatCompletionsBody): AssistantMessage {
   const message = body.choices?.[0]?.message;
-  const reasoning = firstString(message ?? {}, ["reasoning_content", "reasoning", "reasoning_text"]);
+  const reasoning = firstReasoningField(message ?? {});
   return {
     role: "assistant",
     content: message?.content ?? "",
-    reasoning: reasoning ? { summary: reasoning } : undefined,
+    reasoning: reasoning ? reasoningFromOpenAIChat(reasoning.content, reasoning.field) : undefined,
     toolCalls: message?.tool_calls ? chatToolCallsToToolCalls(message.tool_calls) : undefined,
     usage: usageFromChat(body.usage),
     raw: body
   };
+}
+
+function reasoningFromOpenAIChat(content: string, field: OpenAIChatReasoningField | undefined): AssistantMessage["reasoning"] {
+  if (!content) {
+    return undefined;
+  }
+  return {
+    summary: content,
+    replay: [
+      {
+        provider: "openai-chat",
+        field: field ?? "reasoning_content",
+        content
+      }
+    ]
+  };
+}
+
+function openAIChatReplay(message: AssistantMessage): Extract<ReasoningReplay, { provider: "openai-chat" }> | undefined {
+  return message.reasoning?.replay?.find(
+    (item): item is Extract<ReasoningReplay, { provider: "openai-chat" }> => item.provider === "openai-chat" && item.content.length > 0
+  );
 }
 
 function usageFromChat(usage: ChatUsage | null | undefined): TokenUsage | undefined {
@@ -351,11 +395,11 @@ function resolveToolCall(
   return toolCall;
 }
 
-function firstString(record: Record<string, unknown>, keys: string[]): string | undefined {
-  for (const key of keys) {
+function firstReasoningField(record: Record<string, unknown>): { field: OpenAIChatReasoningField; content: string } | undefined {
+  for (const key of OPENAI_CHAT_REASONING_FIELDS) {
     const value = record[key];
     if (typeof value === "string" && value.length > 0) {
-      return value;
+      return { field: key, content: value };
     }
   }
   return undefined;

@@ -167,6 +167,10 @@ test("session store persists readable turn messages without provider raw delta e
         {
           role: "assistant",
           content: "final answer",
+          reasoning: {
+            summary: "planned",
+            replay: [{ provider: "anthropic", blocks: [{ type: "thinking", thinking: "planned", signature: "sig_1" }] }]
+          },
           usage: { inputTokens: 10, outputTokens: 3, totalTokens: 13 },
           raw: [{ type: "response.output_text.delta", delta: "final " }, { type: "response.output_text.delta", delta: "answer" }]
         },
@@ -189,6 +193,9 @@ test("session store persists readable turn messages without provider raw delta e
     const assistant = loaded.messages[1];
     assert.equal(assistant?.role, "assistant");
     assert.equal(assistant?.content, "final answer");
+    assert.deepEqual(assistant?.reasoning?.replay, [
+      { provider: "anthropic", blocks: [{ type: "thinking", thinking: "planned", signature: "sig_1" }] }
+    ]);
     assert.equal("raw" in (assistant ?? {}), false);
     assert.equal("details" in (loaded.messages[2] ?? {}), false);
   } finally {

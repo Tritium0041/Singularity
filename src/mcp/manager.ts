@@ -1,27 +1,37 @@
 import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { WebSocketClientTransport } from "@modelcontextprotocol/sdk/client/websocket.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { WebSocket } from "ws";
 import type { JsonSchema } from "../types.js";
-import type { AgentTool, ToolResult } from "../tools/registry.js";
+import type { AgentTool, ToolAccess, ToolResult } from "../tools/registry.js";
 import type { McpConfig, McpDiagnostic, McpManagerOptions, McpServerConfig, McpToolInfo } from "./types.js";
 
 type RunningServer = {
   name: string;
   config: McpServerConfig;
   client: Client;
-  transport: StdioClientTransport;
+  transport: Transport;
 };
 
 type ListedMcpTool = {
   name: string;
   description?: string;
   inputSchema: JsonSchema;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+  };
 };
 
 type ToolRoute = {
   server: RunningServer;
   info: McpToolInfo;
   parameters: JsonSchema;
+  access: ToolAccess;
 };
 
 export class McpManager {
@@ -78,10 +88,9 @@ export class McpManager {
             serverName,
             rawName: tool.name,
             name: modelName,
-            description: tool.description ?? `MCP tool ${tool.name} from server ${serverName}.`,
-            access: serverConfig.access ?? "execute"
+            description: tool.description ?? `MCP tool ${tool.name} from server ${serverName}.`
           };
-          this.routes.set(modelName, { server, info, parameters: normalizeInputSchema(tool.inputSchema) });
+          this.routes.set(modelName, { server, info, parameters: normalizeInputSchema(tool.inputSchema), access: inferToolAccess(tool) });
         }
       } catch (error) {
         this.diagnostics.push({
@@ -106,13 +115,7 @@ export class McpManager {
   }
 
   private async startServer(serverName: string, config: McpServerConfig): Promise<RunningServer> {
-    const transport = new StdioClientTransport({
-      command: config.command,
-      args: config.args,
-      env: config.env,
-      cwd: config.cwd,
-      stderr: "pipe"
-    });
+    const transport = createTransport(config);
     const client = new Client({
       name: this.clientName,
       version: this.clientVersion
@@ -131,7 +134,7 @@ export class McpManager {
       name: route.info.name,
       description: `[MCP:${route.info.serverName}] ${route.info.description}`,
       parameters: route.parameters,
-      access: route.info.access,
+      access: route.access,
       executionMode: "sequential",
       execute: async (args) => {
         try {
@@ -155,6 +158,67 @@ export class McpManager {
   }
 }
 
+function createTransport(config: McpServerConfig): Transport {
+  if (config.transport === "stdio") {
+    return new StdioClientTransport({
+      command: config.command,
+      args: config.args,
+      env: config.env,
+      cwd: config.cwd,
+      stderr: "pipe"
+    });
+  }
+
+  if (config.transport === "streamable-http" || config.transport === "streamable_http" || config.transport === "streamableHttp" || config.transport === "http") {
+    return new StreamableHTTPClientTransport(parseUrl(config.url), {
+      requestInit: headersToRequestInit(config.headers),
+      sessionId: config.sessionId
+    });
+  }
+
+  if (config.transport === "sse") {
+    return new SSEClientTransport(parseUrl(config.url), {
+      requestInit: headersToRequestInit(config.headers),
+      eventSourceInit: config.headers ? { fetch: fetchWithHeaders(config.headers) } : undefined
+    });
+  }
+
+  ensureWebSocketGlobal();
+  return new WebSocketClientTransport(parseUrl(config.url));
+}
+
+function ensureWebSocketGlobal(): void {
+  if (typeof globalThis.WebSocket === "function") {
+    return;
+  }
+  (globalThis as unknown as { WebSocket: unknown }).WebSocket = WebSocket;
+}
+
+function parseUrl(value: string): URL {
+  try {
+    return new URL(value);
+  } catch (error) {
+    throw new Error(`Invalid MCP server URL ${value}: ${formatError(error)}`);
+  }
+}
+
+function headersToRequestInit(headers: Record<string, string> | undefined): RequestInit | undefined {
+  return headers ? { headers } : undefined;
+}
+
+function fetchWithHeaders(headers: Record<string, string>): typeof fetch {
+  return (input, init) => {
+    const mergedHeaders = new Headers(init?.headers);
+    for (const [key, value] of Object.entries(headers)) {
+      mergedHeaders.set(key, value);
+    }
+    return fetch(input, {
+      ...init,
+      headers: mergedHeaders
+    });
+  };
+}
+
 function isToolEnabled(toolName: string, config: McpServerConfig): boolean {
   if (config.enabledTools && !config.enabledTools.includes(toolName)) {
     return false;
@@ -163,6 +227,16 @@ function isToolEnabled(toolName: string, config: McpServerConfig): boolean {
     return false;
   }
   return true;
+}
+
+function inferToolAccess(tool: ListedMcpTool): ToolAccess {
+  if (tool.annotations?.readOnlyHint === true) {
+    return "read";
+  }
+  if (tool.annotations?.destructiveHint === true) {
+    return "write";
+  }
+  return "execute";
 }
 
 function uniqueModelToolName(serverName: string, toolName: string, usedNames: Set<string>): string {

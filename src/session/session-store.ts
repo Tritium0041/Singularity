@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { AgentMessage, AssistantContextMetadata, ReasoningOutput, RequestContextMetadata, TokenUsage, ToolCall } from "../types.js";
+import type {
+  AgentMessage,
+  AssistantContextMetadata,
+  ReasoningOutput,
+  ReasoningReplay,
+  RequestContextMetadata,
+  TokenUsage,
+  ToolCall
+} from "../types.js";
 import { WORKSPACE_NOTE_KINDS, type WorkspaceNote, type WorkspaceState } from "../memory/index.js";
 import { Planner, type PlanState } from "../planning/index.js";
 
@@ -379,8 +387,67 @@ function parseToolCalls(value: unknown): ToolCall[] {
 function parseReasoningOutput(value: unknown): ReasoningOutput {
   const object = expectObject(value, "assistant reasoning");
   return {
-    summary: object.summary === undefined ? undefined : expectString(object.summary, "assistant reasoning summary")
+    summary: object.summary === undefined ? undefined : expectString(object.summary, "assistant reasoning summary"),
+    replay: object.replay === undefined ? undefined : parseReasoningReplayList(object.replay)
   };
+}
+
+function parseReasoningReplayList(value: unknown): ReasoningReplay[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Invalid assistant reasoning replay: expected an array.");
+  }
+  return value.map(parseReasoningReplay);
+}
+
+function parseReasoningReplay(value: unknown): ReasoningReplay {
+  const object = expectObject(value, "assistant reasoning replay");
+  const provider = expectNonEmptyString(object.provider, "assistant reasoning replay provider");
+  if (provider === "anthropic") {
+    return {
+      provider,
+      blocks: parseAnthropicReplayBlocks(object.blocks)
+    };
+  }
+  if (provider === "openai-chat") {
+    return {
+      provider,
+      field: parseOpenAIChatReasoningField(object.field),
+      content: expectString(object.content, "assistant reasoning replay content")
+    };
+  }
+  throw new Error(`Invalid assistant reasoning replay provider: ${provider}`);
+}
+
+function parseAnthropicReplayBlocks(value: unknown): Extract<ReasoningReplay, { provider: "anthropic" }>["blocks"] {
+  if (!Array.isArray(value)) {
+    throw new Error("Invalid assistant reasoning replay blocks: expected an array.");
+  }
+  return value.map((item) => {
+    const object = expectObject(item, "assistant reasoning replay block");
+    const type = expectNonEmptyString(object.type, "assistant reasoning replay block type");
+    if (type === "thinking") {
+      return {
+        type,
+        thinking: expectString(object.thinking, "assistant reasoning replay thinking"),
+        signature: object.signature === undefined ? undefined : expectString(object.signature, "assistant reasoning replay signature")
+      };
+    }
+    if (type === "redacted_thinking") {
+      return {
+        type,
+        data: expectString(object.data, "assistant reasoning replay redacted data")
+      };
+    }
+    throw new Error(`Invalid assistant reasoning replay block type: ${type}`);
+  });
+}
+
+function parseOpenAIChatReasoningField(value: unknown): Extract<ReasoningReplay, { provider: "openai-chat" }>["field"] {
+  const field = expectNonEmptyString(value, "assistant reasoning replay field");
+  if (field === "reasoning_content" || field === "reasoning" || field === "reasoning_text") {
+    return field;
+  }
+  throw new Error(`Invalid assistant reasoning replay field: ${field}`);
 }
 
 function parseAssistantContext(value: unknown): AssistantContextMetadata {
